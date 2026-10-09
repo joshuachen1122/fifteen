@@ -1,0 +1,41 @@
+{% set s = spot_ctx %}
+<section id="spot-panel" class="panel"
+         hx-get="/partials/spot" hx-trigger="every 2s [!document.querySelector('#spot-panel:hover')]" hx-swap="outerHTML">
+  <h2>Live BTC spot vs strike K</h2>
+  <div class="hero">
+    <div>
+      <div class="label">BTC spot{% if s.spot_source %} · {{ s.spot_source }}{% endif %}</div>
+      <div class="value">{% if s.spot is not none %}${{ "{:,.2f}".format(s.spot) }}{% else %}—{% endif %}</div>
+    </div>
+    {% if s.focus %}
+    <div>
+      <div class="label">Nearest strike K · {{ s.focus.state.ticker }}</div>
+      <div class="value secondary">${{ "{:,.0f}".format(s.focus.state.strike_price) }}</div>
+    </div>
+    <div>
+      <div class="label">Spot − K</div>
+      <div class="value">
+        {{ "▲ above" if s.distance >= 0 else "▼ below" }} ${{ "{:,.0f}".format(s.distance | abs) }}
+      </div>
+    </div>
+    <div>
+      <div class="label">Time left</div>
+      <div class="value secondary">{{ s.focus.state.seconds_remaining // 60 }}m {{ "%02d" | format(s.focus.state.seconds_remaining % 60) }}s</div>
+    </div>
+    {% endif %}
+  </div>
+  {{ s.chart | safe }}
+  {% if s.history %}
+  <details>
+    <summary>Data table (last {{ s.history | length }} ticks)</summary>
+    <table>
+      <thead><tr><th>Time (UTC)</th><th>Price</th></tr></thead>
+      <tbody>
+        {% for t in s.history | reverse %}
+        <tr><td>{{ t.timestamp.strftime("%H:%M:%S") }}</td><td>${{ "{:,.2f}".format(t.price) }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+</section>
