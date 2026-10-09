@@ -6,7 +6,7 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Optional
 
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import Integer, cast, func
 from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -43,7 +43,7 @@ class AgentStats(BaseModel):
     llm_calls_today: int
     llm_approvals: int
     approval_rate_pct: Optional[float]
-    bet_per_call_pct: Optional[float]  # share of LLM calls that ended in a filled bet
+    bet_per_call_pct: Optional[float]  # share of tracked LLM calls that ended in a filled bet
 
     # LLM spend (USD)
     llm_cost_total: float
@@ -86,11 +86,13 @@ async def compute_stats(
     wins = sum(1 for b in settled if (b.realized_pnl_cents or 0) > 0)
 
     called = col(EvaluationTraceRecord.llm_cost_usd).is_not(None)
-    calls, approvals, cost, uncached, cache_read, cache_write, first_call = (
+    # Cast before summing: SQLAlchemy types SUM(boolean) as Boolean, which collapses any count to True.
+    calls, approvals, traded, cost, uncached, cache_read, cache_write, first_call = (
         await session.exec(
             select(
                 func.count(),
-                func.coalesce(func.sum(EvaluationTraceRecord.llm_should_bet), 0),
+                func.coalesce(func.sum(cast(EvaluationTraceRecord.llm_should_bet, Integer)), 0),
+                func.coalesce(func.sum(cast(EvaluationTraceRecord.decision == "trade", Integer)), 0),
                 func.coalesce(func.sum(EvaluationTraceRecord.llm_cost_usd), 0.0),
                 func.coalesce(func.sum(EvaluationTraceRecord.llm_input_tokens), 0),
                 func.coalesce(func.sum(EvaluationTraceRecord.llm_cache_read_tokens), 0),
@@ -149,7 +151,7 @@ async def compute_stats(
         llm_calls_today=calls_today,
         llm_approvals=int(approvals),
         approval_rate_pct=_pct(int(approvals), calls),
-        bet_per_call_pct=_pct(len(bets), calls),
+        bet_per_call_pct=_pct(int(traded), calls),
         llm_cost_total=llm_cost,
         llm_cost_today=float(cost_today),
         llm_daily_budget=llm_daily_budget_usd,

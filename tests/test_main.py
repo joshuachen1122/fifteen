@@ -480,3 +480,23 @@ async def test_activity_panel_shows_positions_fills_and_llm_verdicts(db: Databas
     assert page.status_code == 200
     for text in ("Open positions (1)", "✓ traded", "✕ vetoed", "macro news window", "Macro news window", TICKER):
         assert text in page.text
+
+
+async def test_stats_count_multiple_llm_approvals(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.restore()
+    await agent.handle_candidate(yes_candidate(agent))  # approved and traded
+    for ticker in ("KXBTC15M-26OCT091430-B82500", "KXBTC15M-26OCT091445-B82500"):
+        await agent.handle_candidate(yes_candidate(agent).model_copy(update={"ticker": ticker}))  # approved
+    vetoing = make_agent(db, clock, FakeEvaluator(should_bet=False))
+    await vetoing.restore()
+    await vetoing.handle_candidate(yes_candidate(vetoing).model_copy(update={"ticker": "KXBTC15M-26OCT091500-B82500"}))
+    await agent.refresh_stats()
+
+    stats = agent.dashboard.stats
+    assert stats is not None
+    assert (stats.llm_calls, stats.llm_approvals) == (4, 3)
+    assert stats.approval_rate_pct == pytest.approx(75.0)
+    traded = sum(1 for d in (agent.dashboard.activity.decisions if agent.dashboard.activity else []) if d.decision == "trade")
+    assert stats.bet_per_call_pct == pytest.approx(traded / 4 * 100)
