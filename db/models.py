@@ -133,7 +133,7 @@ class TradeRecord(SQLModel, table=True):
 
     # Exchange lifecycle
     kalshi_order_id: Optional[str] = Field(default=None, index=True)
-    status: str = Field(default="pending", index=True)  # pending | filled | partial | cancelled | rejected | settled
+    status: str = Field(default="pending", index=True)  # pending | skipped | filled | partial | cancelled | settled
     is_paper: bool = True
     filled_count: int = 0
     avg_fill_price_cents: Optional[float] = None

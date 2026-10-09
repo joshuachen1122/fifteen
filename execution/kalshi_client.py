@@ -61,6 +61,13 @@ def cents_field(raw: dict[str, Any], key: str) -> int | None:
     return round(float(dollars) * 100)
 
 
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return None if value in (None, "") else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class KalshiRequestSigner:
     """Builds Kalshi auth headers: base64(RSA-PSS-SHA256(timestamp_ms + METHOD + path))."""
 
@@ -108,6 +115,8 @@ class KalshiMarket(BaseModel):
     yes_bid: int | None = None
     yes_ask: int | None = None
     volume: int = 0
+    result: str = ""  # "yes" | "no" once determined, else ""
+    settlement_price: float | None = None
 
     @classmethod
     def from_api(cls, raw: dict[str, Any]) -> KalshiMarket:
@@ -127,6 +136,8 @@ class KalshiMarket(BaseModel):
             yes_bid=cents_field(raw, "yes_bid"),
             yes_ask=cents_field(raw, "yes_ask"),
             volume=int(float(raw.get("volume", raw.get("volume_fp", 0)) or 0)),
+            result=raw.get("result") or "",
+            settlement_price=_float_or_none(raw.get("expiration_value")),
         )
 
     def to_quote(self, updated_at: datetime | None = None) -> MarketQuote | None:
@@ -220,7 +231,7 @@ class KalshiClient:
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None, **overrides: Any) -> KalshiClient:
         """Configure from ``TRADING_ENABLED``, ``KALSHI_ENV`` (demo|prod), ``KALSHI_API_KEY_ID``,
-        ``KALSHI_PRIVATE_KEY_PATH`` or ``KALSHI_PRIVATE_KEY`` (PEM), ``KALSHI_RATE_LIMIT_RPS``,
+        (or ``KALSHI_KEY_ID``), ``KALSHI_PRIVATE_KEY_PATH`` or ``KALSHI_PRIVATE_KEY`` (PEM), ``KALSHI_RATE_LIMIT_RPS``,
         and ``PAPER_STARTING_BALANCE_CENTS``."""
         env = dict(os.environ) if env is None else env
         trading_enabled = env.get("TRADING_ENABLED", "false").strip().lower() in _TRUTHY
@@ -229,7 +240,7 @@ class KalshiClient:
             raise ValueError(f"KALSHI_ENV must be 'demo' or 'prod', got {kalshi_env!r}")
 
         signer: KalshiRequestSigner | None = None
-        key_id = env.get("KALSHI_API_KEY_ID")
+        key_id = env.get("KALSHI_API_KEY_ID") or env.get("KALSHI_KEY_ID")
         if key_id and env.get("KALSHI_PRIVATE_KEY_PATH"):
             signer = KalshiRequestSigner.from_file(key_id, env["KALSHI_PRIVATE_KEY_PATH"])
         elif key_id and env.get("KALSHI_PRIVATE_KEY"):
@@ -338,6 +349,15 @@ class KalshiClient:
             cursor = body.get("cursor") or None
             if cursor is None:
                 return markets
+
+    async def get_market(self, ticker: str) -> KalshiMarket:
+        body = await self._request("GET", f"/markets/{ticker}", auth=self._signer is not None)
+        return KalshiMarket.from_api(body["market"])
+
+    def credit_paper_balance(self, cents: int) -> None:
+        """Return settlement payouts to the paper balance (live balances are credited by Kalshi)."""
+        if self.is_paper:
+            self._paper_balance_cents += cents
 
     async def submit_order(self, order: OrderRequest, *, client_order_id: str | None = None) -> OrderResult:
         """Submit a buy limit order priced at ``max_cost_cents // count`` per contract."""

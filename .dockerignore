@@ -1,0 +1,12 @@
+.git
+.venv
+worktrees
+**/__pycache__
+.pytest_cache
+*.db
+*.db-*
+.env
+.env.*
+kalshi_keys.txt
+*.pem
+tests

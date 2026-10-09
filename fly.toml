@@ -1,0 +1,42 @@
+# Fly.io config for the KXBTC15M agent. This is a NEW app; it does not deploy to rocket-trading.
+#   fly apps create btc-15m-kalshi-agent
+#   fly volumes create agent_data --region iad --size 1 -a btc-15m-kalshi-agent
+#   fly secrets set ANTHROPIC_API_KEY=... KALSHI_KEY_ID=... KALSHI_PRIVATE_KEY="$(cat key.pem)" -a btc-15m-kalshi-agent
+#   fly deploy
+app = "btc-15m-kalshi-agent"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DATABASE_URL = "sqlite+aiosqlite:////data/agent.db"
+  PORT = "8080"
+  LOG_LEVEL = "INFO"
+  KALSHI_ENV = "demo"
+  TRADING_ENABLED = "false"  # flip to "true" (with KALSHI_ENV=prod) only for real-money trading
+
+# SQLite lives on the volume, so run exactly one machine and never auto-stop it.
+[mounts]
+  source = "agent_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval = "30s"
+    timeout = "5s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
