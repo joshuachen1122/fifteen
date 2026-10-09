@@ -8,3 +8,4 @@ __pycache__/
 kalshi_keys.txt
 *.pem
 worktrees/
+dashboard_password.txt

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import signal
 from collections import Counter
@@ -644,7 +645,9 @@ class TradingAgent:
 
         # Book what actually executed: live fills can be cheaper than the limit, and Kalshi
         # reports the fee it charged.
-        price = ask if result.avg_fill_price_cents is None else round(result.avg_fill_price_cents)
+        # Kalshi fills can be sub-penny (e.g. 0.2c); the RiskEngine books whole cents, so round the
+        # price up (overstating cost, never understating it). The exact price is kept on the record.
+        price = ask if result.avg_fill_price_cents is None else max(1, math.ceil(result.avg_fill_price_cents - 1e-9))
         fee = result.fees_cents if result.fees_cents is not None else kalshi_taker_fee_cents(result.filled_count, price)
         filled = order.model_copy(
             update={"count": result.filled_count, "max_cost_cents": result.filled_count * price + fee}

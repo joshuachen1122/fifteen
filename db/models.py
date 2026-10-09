@@ -105,6 +105,8 @@ class EvaluationTraceRecord(SQLModel, table=True):
     llm_cache_write_tokens: Optional[int] = None
     llm_cost_usd: Optional[float] = None
 
+    is_paper: Optional[bool] = Field(default=None, index=True)  # mode at decision time; null = before modes
+
     # Final decision
     decision: str = Field(index=True)  # "trade" | "skip"
     skip_reason: Optional[str] = None

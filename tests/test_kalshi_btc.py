@@ -807,3 +807,44 @@ async def test_scanner_reprices_only_when_top_of_book_moves_or_interval_elapses(
     now[0] += timedelta(seconds=1.5)  # spot may have moved: periodic re-price
     scanner.handle_message(delta(30, 1, "yes", seq=5))
     assert len(pricer.calls) == 3
+
+
+async def test_live_fill_details_retry_until_the_fill_is_visible(signer: KalshiRequestSigner) -> None:
+    calls = {"fills": 0}
+
+    def fills(request: httpx.Request) -> dict[str, Any]:
+        calls["fills"] += 1
+        if calls["fills"] < 3:
+            return {"fills": []}  # not yet visible right after the IOC order returns
+        return {"fills": [{"order_id": "ord-3", "count_fp": "1.00", "yes_price_dollars": "0.0020",
+                           "no_price_dollars": "0.9980", "fee_cost": "0.000200"}]}
+
+    recorder = Recorder(
+        {
+            ("POST", "/trade-api/v2/portfolio/events/orders"): {"order_id": "ord-3", "fill_count": "1.00", "remaining_count": "0.00", "ts_ms": 1},
+            ("GET", "/trade-api/v2/portfolio/fills"): fills,
+        }
+    )
+    order = OrderRequest(ticker=TICKER, side="yes", count=1, max_cost_cents=2, kelly_fraction=0.0, reasoning="t")
+    async with make_client(recorder, signer=signer, trading_enabled=True) as client:
+        result = await client.submit_order(order)
+    assert calls["fills"] == 3
+    assert result.avg_fill_price_cents == pytest.approx(0.2) and result.fees_cents == 1
+
+
+async def test_live_fill_details_fall_back_to_the_order_record(signer: KalshiRequestSigner) -> None:
+    recorder = Recorder(
+        {
+            ("POST", "/trade-api/v2/portfolio/events/orders"): {"order_id": "ord-4", "fill_count": "2.00", "remaining_count": "0.00", "ts_ms": 1},
+            ("GET", "/trade-api/v2/portfolio/fills"): {"fills": []},
+            ("GET", "/trade-api/v2/portfolio/orders/ord-4"): {
+                "order": {"order_id": "ord-4", "side": "no", "taker_fill_cost_dollars": "0.860000", "taker_fees_dollars": "0.030000",
+                          "maker_fill_cost_dollars": "0.000000", "maker_fees_dollars": "0.000000"}
+            },
+        }
+    )
+    order = OrderRequest(ticker=TICKER, side="no", count=2, max_cost_cents=90, kelly_fraction=0.0, reasoning="t")
+    async with make_client(recorder, signer=signer, trading_enabled=True) as client:
+        client_fast = client
+        result = await client_fast.submit_order(order)
+    assert result.avg_fill_price_cents == pytest.approx(43.0) and result.fees_cents == 3

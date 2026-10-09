@@ -614,7 +614,7 @@ async def test_switch_to_live_sizes_from_the_exchange_shard_and_books_actual_fil
     assert exchange_index == 2 and order.max_cost_cents == order.count * YES_ASK  # limit at the ask
     [row] = [r for r in await trade_rows(db) if r.side]
     assert (row.is_paper, row.avg_fill_price_cents, row.fees_cents) == (False, 79.4, 1)
-    assert agent.risk.cash_cents == 2829 - row.filled_count * 79 - 1
+    assert agent.risk.cash_cents == 2829 - row.filled_count * 80 - 1  # 79.4c booked conservatively at 80c
 
     # The mode persists across restarts.
     again = make_live_agent(db, clock, FakeLiveClient())
@@ -712,3 +712,17 @@ async def test_controls_are_read_only_without_a_password(db: Database) -> None:
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as http:
         response = await http.post("/controls/mode", data={"mode": "live"})
     assert "Set DASHBOARD_PASSWORD" in response.text and agent.client.is_paper
+
+
+async def test_sub_penny_live_fill_is_booked_at_one_cent_and_recorded_exactly(db: Database) -> None:
+    clock = Clock(T0)
+    live = FakeLiveClient(fill_price=0.2, fee=1)
+    agent = make_live_agent(db, clock, live)
+    await agent.load_controls()
+    await agent.restore()
+    await agent.switch_mode(True)
+    await agent.handle_candidate(yes_candidate(agent))
+    [position] = agent._positions.values()
+    assert position.price_cents == 1  # never 0c
+    [row] = [r for r in await trade_rows(db) if r.side]
+    assert row.avg_fill_price_cents == pytest.approx(0.2)

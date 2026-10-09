@@ -7,6 +7,7 @@ while market-data reads still go to the real API so paper trading sees real pric
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import math
@@ -430,17 +431,25 @@ class KalshiClient:
             result = await self._with_fill_details(result)
         return result
 
-    async def _with_fill_details(self, result: OrderResult) -> OrderResult:
-        """Price and fee from the fills ledger, which states YES and NO prices explicitly."""
-        try:
-            body = await self._request("GET", "/portfolio/fills", params={"order_id": result.order_id})
-        except KalshiAPIError as exc:
-            logger.warning("could not load fills for %s: %s", result.order_id, exc)
-            return result
-        fills = [f for f in body.get("fills", []) if f.get("order_id") == result.order_id]
+    async def _with_fill_details(self, result: OrderResult, attempts: int = 4, delay: float = 0.25) -> OrderResult:
+        """Price and fee from the fills ledger, which states YES and NO prices explicitly.
+
+        Fills can take a moment to appear after an immediate-or-cancel order returns; if they
+        never do, fall back to the order record's taker cost and fees (also side-explicit)."""
+        fills: list[dict[str, Any]] = []
+        for attempt in range(attempts):
+            try:
+                body = await self._request("GET", "/portfolio/fills", params={"order_id": result.order_id})
+                fills = [f for f in body.get("fills", []) if f.get("order_id") == result.order_id]
+            except KalshiAPIError as exc:
+                logger.warning("could not load fills for %s: %s", result.order_id, exc)
+            if fills:
+                break
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay)
         count = sum(float(f.get("count_fp") or f.get("count") or 0) for f in fills)
         if count <= 0:
-            return result
+            return await self._with_order_record_costs(result)
         price_key = f"{result.side}_price_dollars"
         notional = sum(float(f.get("count_fp") or f.get("count") or 0) * float(f[price_key]) for f in fills)
         fees = sum(float(f.get("fee_cost") or 0) for f in fills)
@@ -449,6 +458,24 @@ class KalshiClient:
                 "avg_fill_price_cents": notional / count * 100,
                 "fees_cents": math.ceil(fees * 100 - 1e-9),
                 "raw": {**result.raw, "fills": fills},
+            }
+        )
+
+    async def _with_order_record_costs(self, result: OrderResult) -> OrderResult:
+        try:
+            order = (await self._request("GET", f"/portfolio/orders/{result.order_id}")).get("order") or {}
+        except KalshiAPIError as exc:
+            logger.warning("could not load order %s: %s", result.order_id, exc)
+            return result
+        cost = float(order.get("taker_fill_cost_dollars") or 0) + float(order.get("maker_fill_cost_dollars") or 0)
+        fees = float(order.get("taker_fees_dollars") or 0) + float(order.get("maker_fees_dollars") or 0)
+        if cost <= 0 or result.filled_count <= 0:
+            return result
+        return result.model_copy(
+            update={
+                "avg_fill_price_cents": cost / result.filled_count * 100,
+                "fees_cents": math.ceil(fees * 100 - 1e-9),
+                "raw": {**result.raw, "order": order},
             }
         )
 
