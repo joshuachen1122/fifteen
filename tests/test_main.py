@@ -809,3 +809,23 @@ async def test_hourly_evaluation_runs_in_a_subprocess_and_reaches_the_dashboard(
         assert page.status_code == 200 and "Held-out backtest" in page.text and "waiting for data" in page.text
     finally:
         await database.dispose()
+
+
+async def test_no_pricing_or_snapshots_until_volatility_has_a_full_window(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    cold = BtcSpotFeed()
+    for i in range(60):  # one minute of history against a 300s lookback
+        cold.buffer.add_tick(BtcSpotTick(source="coinbase", price=82_700.0 + (i % 3), timestamp=T0 - timedelta(seconds=59 - i)))
+    agent.feed = cold
+    agent.state_manager._spot = cold
+    await agent.restore()
+    assert not agent.spot_warm() and agent.spot_context() is None
+    assert agent.scanner.evaluate(TICKER) == []
+    await agent.sync_markets()
+    assert await agent.write_snapshots() == 0
+
+    for i in range(1, 200):  # now 259s >= 80% of 300s
+        cold.buffer.add_tick(BtcSpotTick(source="coinbase", price=82_700.0 + (i % 5), timestamp=T0 + timedelta(seconds=i)))
+    clock.now = T0 + timedelta(seconds=199)
+    assert agent.spot_warm() and agent.spot_context() is not None

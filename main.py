@@ -75,6 +75,7 @@ class Settings(BaseSettings):
 
     # Trading loop
     spot_persist_interval_sec: float = 5.0
+    vol_warmup_fraction: float = 0.8  # don't price until spot history covers this share of the vol lookback
     dashboard_refresh_sec: float = 1.0
     stats_refresh_sec: float = 5.0
 
@@ -374,8 +375,13 @@ class TradingAgent:
             self._last_dashboard_tick = tick.timestamp
             self.dashboard.update_spot(tick)
 
+    def spot_warm(self) -> bool:
+        """Volatility over a few seconds of data is meaningless (it read 2% right after a restart,
+        vs ~12% once warm) and makes every probability overconfident: require most of the lookback."""
+        return len(self.feed.buffer) >= self.params.volatility_lookback_sec * self.settings.vol_warmup_fraction
+
     def spot_context(self) -> Optional[SpotContext]:
-        if self.feed.is_stale(self._clock()):
+        if self.feed.is_stale(self._clock()) or not self.spot_warm():
             return None
         price = self.feed.latest_price()
         vol = self.feed.volatility(self.params.volatility_lookback_sec)
@@ -474,7 +480,7 @@ class TradingAgent:
             await self.state_manager.update_quote(quote)
             await self.state_manager.update_order_book_imbalance(ticker, book.imbalance)
             state = await self.state_manager.get_market_state(ticker)
-            if state is not None:
+            if state is not None and self.spot_warm():
                 fair = self.fair_value(state, quote)
                 self.dashboard.update_market(state, fair, quote)
                 self._snapshots[ticker] = MarketSnapshot(
@@ -819,6 +825,7 @@ class TradingAgent:
     async def poll_once(self) -> None:
         await self.settle_completed()
         await self.record_contract_outcomes()
+        await self.load_latest_evaluation()  # also shows reports from manual runs
         # Parameters change only via the hourly held-out evaluation or the dashboard's optimizer.
         await self.reload_parameters()
 
