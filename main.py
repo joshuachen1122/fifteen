@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import signal
+import sys
 from collections import Counter
 from collections.abc import Callable, Iterator
 from datetime import date, datetime, time, timezone
@@ -38,13 +39,23 @@ from core.constants import DEFAULT_DATABASE_URL, SPOT_SOURCE_COINBASE
 from core.schemas import Btc15mMarketState, BtcSpotTick, FairValueOutput, LLMVerdict, MarketQuote, OrderRequest, StrategyParameters
 from core.state_manager import BtcStateManager
 from db.database import Database
-from db.models import BtcPriceHistory, EvaluationTraceRecord, RuntimeSetting, TradeRecord, utc_now
-from execution.kalshi_client import KalshiAPIError, KalshiClient, OrderResult
+from db.models import (
+    BtcPriceHistory,
+    ContractOutcome,
+    EvaluationReportRecord,
+    EvaluationTraceRecord,
+    MarketSnapshot,
+    RuntimeSetting,
+    TradeRecord,
+    utc_now,
+)
+from execution.kalshi_client import KalshiAPIError, KalshiClient, KalshiMarket, OrderResult
 from execution.order_scanner import KalshiOrderBookScanner, ScanCandidate, SpotContext
 from pricing.btc_digital_option import price_digital_option
 from pricing.greeks import MIN_ENTRY_SECONDS, check_entry_guardrail
 from services.btc_spot_feed import BtcSpotFeed
 from services.agent_stats import compute_activity, compute_stats
+from services.evaluation import EvaluationReport
 from services.llm_evaluator import LLMEvaluator, LLMUsage
 from services.optimizer import Optimizer, load_active_parameters
 from services.risk_engine import Position, RiskEngine, kalshi_taker_fee_cents
@@ -81,11 +92,15 @@ class Settings(BaseSettings):
     allow_live_trading: bool = False  # server-side guard; the dashboard cannot enable live without it
     dashboard_password: Optional[str] = None  # HTTP basic auth; required before live trading is allowed
 
-    # Settlement & auto-tuning
+    # Settlement, research data & evaluation
     settlement_poll_sec: float = 180.0
-    optimize_every_n_settled: int = 20
-    nightly_optimize_hour_utc: int = 4
-    optimizer_min_trades: int = 30
+    snapshot_interval_sec: float = 5.0  # unconditional market snapshots for research/backtests
+    evaluation_interval_sec: float = 3600.0  # hourly report-only evaluation (separate process)
+    evaluation_timeout_sec: float = 1200.0
+    auto_apply_params: bool = True  # apply tuned parameters only when they win on held-out trades
+    auto_apply_min_trades: int = 300
+    auto_apply_cooldown_hours: float = 24.0
+    optimizer_min_trades: int = 30  # manual "Optimize Parameters" button on the dashboard
 
     # Dashboard / health checks
     web_enabled: bool = True
@@ -151,8 +166,7 @@ class TradingAgent:
 
         self._latest_tick: Optional[BtcSpotTick] = None
         self._last_dashboard_tick: Optional[datetime] = None
-        self.settled_since_optimization = 0
-        self._last_nightly_run: Optional[date] = None
+        self._snapshots: dict[str, MarketSnapshot] = {}  # latest per live contract, written every few seconds
 
     @property
     def params(self) -> StrategyParameters:
@@ -461,7 +475,22 @@ class TradingAgent:
             await self.state_manager.update_order_book_imbalance(ticker, book.imbalance)
             state = await self.state_manager.get_market_state(ticker)
             if state is not None:
-                self.dashboard.update_market(state, self.fair_value(state, quote), quote)
+                fair = self.fair_value(state, quote)
+                self.dashboard.update_market(state, fair, quote)
+                self._snapshots[ticker] = MarketSnapshot(
+                    ts=self._clock(),
+                    ticker=ticker,
+                    strike_price=state.strike_price,
+                    close_time=state.expiration_time,
+                    seconds_remaining=state.seconds_remaining,
+                    yes_bid=quote.yes_bid,
+                    yes_ask=quote.yes_ask,
+                    spot_price=state.current_spot_price,
+                    historical_volatility=state.historical_volatility,
+                    momentum_1m=state.momentum_1m,
+                    order_book_imbalance=state.order_book_imbalance,
+                    model_probability=fair.model_probability,
+                )
 
     # -- decision pipeline -----------------------------------------------------
 
@@ -788,15 +817,123 @@ class TradingAgent:
                 logger.exception("settlement poll failed")
 
     async def poll_once(self) -> None:
-        settled = await self.settle_completed()
-        self.settled_since_optimization += settled
+        await self.settle_completed()
+        await self.record_contract_outcomes()
+        # Parameters change only via the hourly held-out evaluation or the dashboard's optimizer.
+        await self.reload_parameters()
+
+    # -- research data & evaluation ---------------------------------------------
+
+    async def snapshot_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.settings.snapshot_interval_sec)
+            try:
+                await self.write_snapshots()
+            except Exception:
+                logger.exception("failed to write market snapshots")
+
+    async def write_snapshots(self) -> int:
+        """Persist the latest sample of each live contract (skips stale ones)."""
         now = self._clock()
-        if self.settled_since_optimization >= self.settings.optimize_every_n_settled:
-            await self.run_optimizer(f"{self.settled_since_optimization} trades settled")
-        elif now.hour == self.settings.nightly_optimize_hour_utc and self._last_nightly_run != now.date():
-            self._last_nightly_run = now.date()
-            await self.run_optimizer("nightly")
-        await self.reload_parameters()  # also picks up optimizer runs started from the dashboard
+        fresh = [
+            s for s in self._snapshots.values()
+            if (now - s.ts).total_seconds() <= 2 * self.settings.snapshot_interval_sec and s.close_time > now
+        ]
+        self._snapshots.clear()
+        if fresh:
+            async with self.db.session() as session:
+                session.add_all(fresh)
+                await session.commit()
+        return len(fresh)
+
+    async def record_contract_outcomes(self, limit: int = 20) -> int:
+        """Store the result of every contract we snapshotted, traded or not."""
+        now = self._clock()
+        async with self.db.session() as session:
+            known = select(ContractOutcome.ticker)
+            pending = (
+                await session.exec(
+                    select(MarketSnapshot.ticker)
+                    .where(MarketSnapshot.close_time <= now, col(MarketSnapshot.ticker).not_in(known))
+                    .distinct()
+                    .limit(limit)
+                )
+            ).all()
+        recorded = 0
+        for ticker in pending:
+            try:
+                market = await self.client.get_market(ticker)
+            except (KalshiAPIError, KeyError, ValueError) as exc:
+                logger.warning("could not fetch outcome for %s: %s", ticker, exc)
+                continue
+            recorded += await self._store_outcome(market)
+        return recorded
+
+    async def _store_outcome(self, market: KalshiMarket) -> int:
+        if market.result not in ("yes", "no"):
+            return 0
+        async with self.db.session() as session:
+            await session.merge(
+                ContractOutcome(
+                    ticker=market.ticker,
+                    strike_price=market.strike_price,
+                    close_time=market.close_time,
+                    settled_yes=market.result == "yes",
+                    settlement_price=market.settlement_price,
+                )
+            )
+            await session.commit()
+        return 1
+
+    async def evaluation_loop(self) -> None:
+        await self.load_latest_evaluation()
+        while True:
+            await asyncio.sleep(self.settings.evaluation_interval_sec)
+            try:
+                await self.run_evaluation()
+            except Exception:
+                logger.exception("evaluation run failed")
+
+    async def run_evaluation(self) -> bool:
+        """Run the evaluation job in a separate, low-priority process so the backtest grid can't
+        starve the order-book feed. Returns True if it completed."""
+        env = {
+            **os.environ,
+            "DATABASE_URL": self.settings.database_url,
+            "AUTO_APPLY_PARAMS": "true" if self.settings.auto_apply_params else "false",
+            "AUTO_APPLY_MIN_TRADES": str(self.settings.auto_apply_min_trades),
+            "AUTO_APPLY_COOLDOWN_HOURS": str(self.settings.auto_apply_cooldown_hours),
+        }
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "services.evaluation",
+            cwd=os.path.dirname(os.path.abspath(__file__)), env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            output, _ = await asyncio.wait_for(proc.communicate(), self.settings.evaluation_timeout_sec)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            logger.error("evaluation timed out after %.0fs", self.settings.evaluation_timeout_sec)
+            return False
+        tail = output.decode(errors="replace").strip().splitlines()[-1:] if output else []
+        if proc.returncode != 0:
+            logger.error("evaluation failed (exit %s): %s", proc.returncode, output.decode(errors="replace")[-2000:])
+            return False
+        logger.info("evaluation finished: %s", tail[0] if tail else "")
+        await self.load_latest_evaluation()
+        await self.reload_parameters()  # picks up parameters it applied, if any
+        return True
+
+    async def load_latest_evaluation(self) -> None:
+        async with self.db.session() as session:
+            row = (
+                await session.exec(
+                    select(EvaluationReportRecord).order_by(col(EvaluationReportRecord.created_at).desc()).limit(1)
+                )
+            ).first()
+        if row is not None:
+            self.dashboard.evaluation = EvaluationReport.model_validate_json(row.report_json)
 
     async def settle_completed(self) -> int:
         """Record outcomes for expired markets. Returns the number of our positions settled."""
@@ -823,6 +960,7 @@ class TradingAgent:
                 continue
             if market.result not in ("yes", "no"):
                 continue  # Kalshi has not determined the outcome yet
+            await self._store_outcome(market)
             settled_yes = market.result == "yes"
 
             async with self.db.session() as session:
@@ -885,7 +1023,6 @@ class TradingAgent:
                 self.dashboard.optimizer_status, self.dashboard.optimizer_error = "error", str(exc)
                 return
             self.dashboard.last_optimization, self.dashboard.optimizer_status = result, "done"
-            self.settled_since_optimization = 0
             logger.info("optimizer: %s", result.message)
 
     # -- lifecycle -------------------------------------------------------------
@@ -898,6 +1035,8 @@ class TradingAgent:
             asyncio.create_task(self.dashboard_loop(), name="dashboard-sync"),
             asyncio.create_task(self.stats_loop(), name="dashboard-stats"),
             asyncio.create_task(self.settlement_loop(), name="settlement-poller"),
+            asyncio.create_task(self.snapshot_loop(), name="market-snapshots"),
+            asyncio.create_task(self.evaluation_loop(), name="hourly-evaluation"),
         ]
 
     async def shutdown(self) -> None:

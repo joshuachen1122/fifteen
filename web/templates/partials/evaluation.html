@@ -1,0 +1,103 @@
+{% macro cents(v) %}{% if v is none %}—{% else %}{{ "%+.2f" | format(v) }}¢{% endif %}{% endmacro %}
+<section id="evaluation-panel" class="panel wide" hx-get="/partials/evaluation" hx-trigger="every 60s" hx-swap="outerHTML">
+  <h2>Hourly evaluation · model, LLM gate &amp; edge</h2>
+  {% if not evaluation %}
+    <div class="empty">No evaluation yet. The first report runs about an hour after startup, once contracts settle.</div>
+  {% else %}
+  {% set e = evaluation %}
+  <div class="toolbar">
+    <span class="muted">Report from {{ e.created_at.strftime("%Y-%m-%d %H:%M") }} UTC · last 30 days · {{ e.contracts }} settled contracts, {{ "{:,}".format(e.snapshots) }} snapshots</span>
+  </div>
+  {% for note in e.notes %}<div class="muted" style="margin-bottom: 8px;">{{ note }}</div>{% endfor %}
+
+  <div class="subhead">Who predicts outcomes better? (lower is better)</div>
+  {% if e.scores %}
+  <table>
+    <thead><tr><th>Predictor</th><th>Brier score</th><th>Log loss</th><th>Snapshots</th></tr></thead>
+    <tbody>
+      {% set best = e.scores | min(attribute="log_loss") %}
+      {% for s in e.scores %}
+      <tr><td>{{ s.name }}{% if s.name == best.name %} <span class="pill good">best</span>{% endif %}</td>
+        <td>{{ "%.4f" | format(s.brier) }}</td><td>{{ "%.4f" | format(s.log_loss) }}</td><td>{{ "{:,}".format(s.n) }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if e.best_blend_weight is not none %}
+  <div class="muted" style="margin-top: 6px;">Best blend puts {{ "%.0f" | format(e.best_blend_weight * 100) }}% weight on our model. Near 0% means the market price already contains everything our model knows.</div>
+  {% endif %}
+  {% else %}<div class="muted">Waiting for settled contracts with snapshots.</div>{% endif %}
+
+  {% if e.horizons %}
+  <div class="subhead">Accuracy by time left (Brier, lower is better)</div>
+  <table>
+    <thead><tr><th>Time left</th><th>Market</th><th>Our model</th><th>Snapshots</th></tr></thead>
+    <tbody>{% for h in e.horizons %}
+      <tr><td>{{ h.label }}</td>
+        <td class="{{ 'delta-up' if h.brier_market < h.brier_model else '' }}">{{ "%.4f" | format(h.brier_market) }}</td>
+        <td class="{{ 'delta-up' if h.brier_model < h.brier_market else '' }}">{{ "%.4f" | format(h.brier_model) }}</td>
+        <td>{{ "{:,}".format(h.n) }}</td></tr>
+    {% endfor %}</tbody>
+  </table>
+  {% endif %}
+
+  {% if e.calibration %}
+  <details>
+    <summary>Model calibration: when it says X%, how often does YES happen?</summary>
+    <table>
+      <thead><tr><th>Model says</th><th>Avg predicted</th><th>Actually YES</th><th>Snapshots</th></tr></thead>
+      <tbody>{% for b in e.calibration %}
+        <tr><td>{{ "%.0f" | format(b.lo * 100) }}–{{ "%.0f" | format(b.hi * 100) }}%</td><td>{{ "%.1f" | format(b.mean_predicted * 100) }}%</td>
+          <td>{{ "%.1f" | format(b.realized * 100) }}%</td><td>{{ "{:,}".format(b.n) }}</td></tr>
+      {% endfor %}</tbody>
+    </table>
+  </details>
+  {% endif %}
+
+  <div class="subhead">Realized edge per contract, after fees</div>
+  {% if e.edges %}
+  <table>
+    <thead><tr><th>Mode</th><th>Settled trades</th><th>Win rate</th><th>Avg price</th><th>Avg fee</th><th>Edge / contract</th><th>95% range</th><th>Total PnL</th></tr></thead>
+    <tbody>{% for x in e.edges %}
+      <tr><td>{{ x.mode | upper }}</td><td>{{ x.trades }}</td><td>{{ "%.1f" | format(x.win_rate * 100) }}%</td>
+        <td>{{ "%.1f" | format(x.avg_price_cents) }}¢</td><td>{{ "%.2f" | format(x.avg_fee_cents) }}¢</td>
+        <td class="{{ 'delta-up' if x.ci_low_cents > 0 else ('delta-down' if x.ci_high_cents < 0 else '') }}">{{ cents(x.edge_cents) }}</td>
+        <td class="muted">{% if x.trades > 1 %}{{ cents(x.ci_low_cents) }} to {{ cents(x.ci_high_cents) }}{% else %}need 2+ trades{% endif %}</td>
+        <td>${{ "{:,.2f}".format(x.total_pnl) }}</td></tr>
+    {% endfor %}</tbody>
+  </table>
+  <div class="muted" style="margin-top: 6px;">The edge is proven only when the whole 95% range is above zero (green). Until then, it's indistinguishable from luck.</div>
+  {% else %}<div class="muted">No settled trades yet.</div>{% endif %}
+
+  <div class="subhead">Is the LLM gate worth it? (hypothetical 1 contract per reviewed candidate)</div>
+  {% if e.llm %}
+  {% set l = e.llm %}
+  <table>
+    <thead><tr><th>Verdict</th><th>Candidates</th><th>Avg result / contract</th></tr></thead>
+    <tbody>
+      <tr><td>Approved</td><td>{{ l.approved }}</td><td>{{ cents(l.approved_edge_cents) }}</td></tr>
+      <tr><td>Vetoed</td><td>{{ l.vetoed }}</td><td>{{ cents(l.vetoed_edge_cents) }}</td></tr>
+    </tbody>
+  </table>
+  <div class="muted" style="margin-top: 6px;">
+    Vetoes {{ "saved" if l.saved_cents >= 0 else "cost" }} {{ "%.0f" | format(l.saved_cents | abs) }}¢ per contract-set.
+    {% if l.brier_llm is not none %}Probability accuracy (Brier): LLM {{ "%.4f" | format(l.brier_llm) }} vs model {{ "%.4f" | format(l.brier_model) }}.{% endif %}
+  </div>
+  {% else %}<div class="muted">No settled LLM-reviewed candidates yet.</div>{% endif %}
+
+  <div class="subhead">Held-out backtest (tune on older 70%, test on newest 30%)</div>
+  {% set b = e.backtest %}
+  <div class="{{ 'delta-up' if b.applied else 'muted' }}">{{ b.status }}</div>
+  {% if b.current %}
+  <table style="margin-top: 6px;">
+    <thead><tr><th>On held-out trades</th><th>Trades</th><th>Net PnL</th><th>Sharpe</th><th>Win rate</th><th>Min edge</th><th>Vol lookback</th><th>Momentum wt</th></tr></thead>
+    <tbody>
+      {% for label, r in [("Active parameters", b.current), ("Best tuned", b.best)] if r %}
+      <tr><td>{{ label }}</td><td>{{ r.trades }}</td><td>${{ "{:,.2f}".format(r.total_net_pnl) }}</td><td>{{ "%.2f" | format(r.sharpe_ratio) }}</td>
+        <td>{{ "%.1f" | format(r.win_rate * 100) }}%</td><td>{{ "%.1f" | format(r.params.min_gross_edge * 100) }}%</td>
+        <td>{{ r.params.volatility_lookback_sec }}s</td><td>{{ "%.2f" | format(r.params.momentum_weight) }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  {% endif %}
+</section>

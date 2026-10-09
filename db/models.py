@@ -198,3 +198,50 @@ class RuntimeSetting(SQLModel, table=True):
     key: str = Field(primary_key=True)
     value: str
     updated_at: datetime = _utc_field(default_now=True)
+
+
+class MarketSnapshot(SQLModel, table=True):
+    """Unconditional sample of a live contract (every few seconds), whether or not it showed an edge.
+
+    Paired with `ContractOutcome`, this is the unbiased dataset for calibration, model research
+    and backtests; trades and evaluation traces only cover moments the scanner flagged.
+    """
+
+    __tablename__ = "market_snapshots"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ts: datetime = _utc_field(index=True)
+    ticker: str = Field(index=True)
+    strike_price: float
+    close_time: datetime = _utc_field()
+    seconds_remaining: int
+    yes_bid: int
+    yes_ask: int
+    spot_price: float
+    historical_volatility: float
+    momentum_1m: float
+    order_book_imbalance: float
+    model_probability: float  # P(YES) from the live pricing model with the parameters active at `ts`
+
+
+class ContractOutcome(SQLModel, table=True):
+    """Settlement of every contract we observed, traded or not."""
+
+    __tablename__ = "contract_outcomes"
+
+    ticker: str = Field(primary_key=True)
+    strike_price: float
+    close_time: datetime = _utc_field()
+    settled_yes: bool
+    settlement_price: Optional[float] = None
+    recorded_at: datetime = _utc_field(default_now=True)
+
+
+class EvaluationReportRecord(SQLModel, table=True):
+    """Output of the hourly evaluation job (JSON-encoded `EvaluationReport`)."""
+
+    __tablename__ = "evaluation_reports"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    created_at: datetime = _utc_field(default_now=True, index=True)
+    report_json: str

@@ -11,7 +11,7 @@ from sqlmodel import select
 
 from core.schemas import BtcSpotTick, FairValueOutput, LLMVerdict
 from db.database import Database
-from db.models import EvaluationTraceRecord, TradeRecord
+from db.models import ContractOutcome, EvaluationReportRecord, EvaluationTraceRecord, MarketSnapshot, TradeRecord
 from execution.kalshi_client import KalshiClient, KalshiMarket
 from execution.order_scanner import OrderBook, ScanCandidate
 from main import Settings, TradingAgent
@@ -207,19 +207,9 @@ async def test_cooldown_limits_llm_calls_per_ticker_side(db: Database) -> None:
     assert len(await trade_rows(db)) == 1  # re-evaluations update the ticker's single row
 
 
-async def test_settlement_books_net_pnl_and_triggers_optimizer(db: Database) -> None:
+async def test_settlement_books_net_pnl_and_records_the_outcome(db: Database) -> None:
     clock = Clock(T0)
-    agent = make_agent(db, clock, FakeEvaluator(), optimize_every_n_settled=1)
-    optimizer_runs: list[Optimizer] = []
-
-    def small_optimizer(engine: Any) -> Optimizer:
-        opt = Optimizer(
-            engine, grid=ParameterGrid(min_gross_edge=[0.03], volatility_lookback_sec=[300], momentum_weight=[0.15])
-        )
-        optimizer_runs.append(opt)
-        return opt
-
-    agent.make_optimizer = small_optimizer  # type: ignore[method-assign]
+    agent = make_agent(db, clock, FakeEvaluator())
     await agent.restore()
     await agent.handle_candidate(yes_candidate(agent))
     [row] = await trade_rows(db)
@@ -227,7 +217,7 @@ async def test_settlement_books_net_pnl_and_triggers_optimizer(db: Database) -> 
 
     # Not yet expired: nothing to settle.
     await agent.poll_once()
-    assert (await trade_rows(db))[0].settled_yes is None and not optimizer_runs
+    assert (await trade_rows(db))[0].settled_yes is None
 
     clock.now = T0 + timedelta(minutes=11)
     assert isinstance(agent.client, SettlingClient)
@@ -246,8 +236,9 @@ async def test_settlement_books_net_pnl_and_triggers_optimizer(db: Database) -> 
     assert await agent.client.get_balance() == 100_000 + count * (100 - YES_ASK)
     assert not agent._positions
 
-    assert len(optimizer_runs) == 1 and agent.settled_since_optimization == 0
-    assert agent.dashboard.optimizer_status == "done"
+    async with db.session() as session:
+        outcome = await session.get(ContractOutcome, TICKER)
+    assert outcome is not None and outcome.settled_yes is True and outcome.settlement_price == 82_710.5
 
 
 async def test_unsettled_market_is_retried_later(db: Database) -> None:
@@ -260,22 +251,6 @@ async def test_unsettled_market_is_retried_later(db: Database) -> None:
     agent.client.results[TICKER] = KalshiMarket(ticker=TICKER, strike_price=STRIKE, close_time=T0, result="")
     assert await agent.settle_completed() == 0
     assert len(agent._positions) == 1
-
-
-async def test_nightly_optimizer_runs_once_per_day(db: Database) -> None:
-    clock = Clock(T0.replace(hour=4))
-    agent = make_agent(db, clock, FakeEvaluator(), nightly_optimize_hour_utc=4)
-    runs: list[str] = []
-
-    async def fake_run(reason: str) -> None:
-        runs.append(reason)
-
-    agent.run_optimizer = fake_run  # type: ignore[method-assign]
-    await agent.restore()
-    await agent.poll_once()
-    clock.now += timedelta(minutes=3)
-    await agent.poll_once()
-    assert runs == ["nightly"]
 
 
 async def test_restore_rebuilds_open_positions_and_bankroll(db: Database) -> None:
@@ -769,3 +744,68 @@ async def test_dashboard_shows_only_the_current_modes_activity(db: Database) -> 
     assert agent.dashboard.stats.llm_calls == 1 and agent.dashboard.stats.bets_made == 1
     assert [d.decision for d in agent.dashboard.activity.decisions] == ["trade"]
     assert [p.ticker for p in agent.dashboard.activity.positions] == [TICKER]
+
+
+# ---------------------------------------------------------------- research data & hourly evaluation
+
+
+async def test_market_snapshots_are_recorded_unconditionally(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.restore()
+    await agent.sync_markets()  # no candidate, no LLM call: still sampled
+    assert await agent.write_snapshots() == 1
+    async with db.session() as s:
+        [snap] = (await s.exec(select(MarketSnapshot))).all()
+    assert (snap.ticker, snap.yes_bid, snap.yes_ask, snap.seconds_remaining) == (TICKER, YES_BID, YES_ASK, 600)
+    assert 0 < snap.model_probability < 1 and snap.historical_volatility > 0
+
+    advance(agent, clock, timedelta(seconds=1))
+    await agent.sync_markets()
+    advance(agent, clock, timedelta(seconds=30))  # sample went stale before the next write
+    assert await agent.write_snapshots() == 0
+
+
+async def test_outcomes_are_recorded_for_contracts_we_never_traded(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.restore()
+    await agent.sync_markets()
+    await agent.write_snapshots()
+    assert await agent.record_contract_outcomes() == 0  # still trading
+
+    clock.now = T0 + timedelta(minutes=11)
+    assert isinstance(agent.client, SettlingClient)
+    agent.client.results[TICKER] = KalshiMarket(ticker=TICKER, strike_price=STRIKE, close_time=T0 + timedelta(minutes=10), result="no")
+    assert await agent.record_contract_outcomes() == 1
+    assert await agent.record_contract_outcomes() == 0  # recorded once
+    async with db.session() as s:
+        outcome = await s.get(ContractOutcome, TICKER)
+    assert outcome is not None and outcome.settled_yes is False
+    assert await trade_rows(db) == []
+
+
+async def test_hourly_evaluation_runs_in_a_subprocess_and_reaches_the_dashboard(tmp_path) -> None:
+    import httpx
+
+    from web.app import create_app
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'agent.db'}"
+    database = Database(url)
+    await database.init()
+    clock = Clock(T0)
+    agent = make_agent(database, clock, FakeEvaluator(), database_url=url)
+    await agent.restore()
+    try:
+        assert await agent.run_evaluation()
+        assert agent.dashboard.evaluation is not None
+        assert agent.dashboard.evaluation.backtest.status.startswith("waiting for data")
+        async with database.session() as s:
+            assert len((await s.exec(select(EvaluationReportRecord))).all()) == 1
+
+        app = create_app(agent.dashboard, database.engine)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as http:
+            page = await http.get("/partials/evaluation")
+        assert page.status_code == 200 and "Held-out backtest" in page.text and "waiting for data" in page.text
+    finally:
+        await database.dispose()

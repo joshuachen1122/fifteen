@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from core.schemas import Btc15mMarketState, BtcSpotTick, FairValueOutput, MarketQuote, StrategyParameters
 from db.session import init_db, make_engine
 from services.agent_stats import AgentActivity, AgentStats
+from services.evaluation import EvaluationReport
 from services.optimizer import OptimizationResult, Optimizer, load_active_parameters
 from web.charts import ReferenceLine, line_chart_svg, usd, usd_cents
 
@@ -74,6 +75,7 @@ class DashboardState:
         self.optimizer_task: Optional[asyncio.Task[None]] = None
         self.stats: Optional[AgentStats] = None  # refreshed by the live trader
         self.activity: Optional[AgentActivity] = None
+        self.evaluation: Optional[EvaluationReport] = None  # latest hourly evaluation
 
     def update_spot(self, tick: BtcSpotTick) -> None:
         self.spot = tick
@@ -204,6 +206,7 @@ def create_app(
             "stats": state.stats,
             "activity": state.activity,
             "controls_ctx": controls_context(),
+            "evaluation": state.evaluation,
         }
         return TEMPLATES.TemplateResponse(request, "index.html", context)
 
@@ -217,6 +220,10 @@ def create_app(
 
     async def form(request: Request) -> dict[str, str]:
         return {k: v[0] for k, v in parse_qs((await request.body()).decode()).items()}
+
+    @app.get("/partials/evaluation", response_class=HTMLResponse)
+    async def evaluation_partial(request: Request) -> HTMLResponse:
+        return TEMPLATES.TemplateResponse(request, "partials/evaluation.html", {"evaluation": state.evaluation})
 
     @app.get("/partials/controls", response_class=HTMLResponse)
     async def controls_partial(request: Request) -> HTMLResponse:
