@@ -43,7 +43,7 @@ from execution.order_scanner import KalshiOrderBookScanner, ScanCandidate, SpotC
 from pricing.btc_digital_option import price_digital_option
 from pricing.greeks import MIN_ENTRY_SECONDS, check_entry_guardrail
 from services.btc_spot_feed import BtcSpotFeed
-from services.agent_stats import compute_stats
+from services.agent_stats import compute_activity, compute_stats
 from services.llm_evaluator import LLMEvaluator, LLMUsage
 from services.optimizer import Optimizer, load_active_parameters
 from services.risk_engine import Position, RiskEngine, kalshi_taker_fee_cents
@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     # Trading loop
     spot_persist_interval_sec: float = 5.0
     dashboard_refresh_sec: float = 1.0
-    stats_refresh_sec: float = 10.0
+    stats_refresh_sec: float = 5.0
 
     # LLM spend controls. Candidates are screened with these free checks before any paid call.
     llm_cooldown_sec: float = 60.0  # min gap between LLM evaluations of the same ticker/side
@@ -292,6 +292,12 @@ class TradingAgent:
                 halted=self.risk.is_trading_halted(now),
                 llm_daily_budget_usd=self.settings.llm_daily_budget_usd,
                 llm_screened=dict(self.llm_screened),
+            )
+            self.dashboard.activity = await compute_activity(
+                session,
+                now=now,
+                is_paper=self.client.is_paper,
+                books={t: (b.best_yes_bid, b.best_yes_ask) for t, b in self.scanner.books.items()},
             )
 
     async def sync_markets(self) -> None:
@@ -556,6 +562,8 @@ class TradingAgent:
             order_book_imbalance=s.order_book_imbalance,
             yes_bid=c.quote.yes_bid,
             yes_ask=c.quote.yes_ask,
+            proposed_side=c.side,
+            proposed_ask_cents=c.ask_cents,
             model_probability=fv.model_probability,
             fair_cents=fv.fair_cents,
             gross_edge=c.edge,

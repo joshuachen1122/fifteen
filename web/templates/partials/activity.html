@@ -1,0 +1,106 @@
+{% macro money(v) %}{{ "−" if v < 0 else "" }}${{ "{:,.2f}".format(v | abs) }}{% endmacro %}
+{% macro signed(v) %}<span class="{{ 'delta-up' if v > 0 else ('delta-down' if v < 0 else '') }}">{{ "+" if v > 0 else "" }}{{ money(v) }}</span>{% endmacro %}
+{% macro prob(v) %}{% if v is none %}—{% else %}{{ "%.1f" | format(v * 100) }}%{% endif %}{% endmacro %}
+{% macro clock(t) %}{{ t.strftime("%H:%M:%S") }}{% endmacro %}
+<section id="activity-panel" class="panel wide" hx-get="/partials/activity" hx-trigger="every 5s" hx-swap="outerHTML">
+  <h2>Positions &amp; recent decisions</h2>
+  {% if not activity %}
+    <div class="empty">Collecting activity…</div>
+  {% else %}
+  {% set a = activity %}
+
+  <div class="subhead">Open positions ({{ a.positions | length }})</div>
+  {% if a.positions %}
+  <table>
+    <thead><tr>
+      <th>Ticker</th><th>Side</th><th>Contracts</th><th>Entry</th><th>Cost incl. fee</th>
+      <th>Model win prob.</th><th>Mark (bid)</th><th>Unrealized</th><th>Settles in</th><th>Entered</th>
+    </tr></thead>
+    <tbody>
+      {% for p in a.positions %}
+      <tr>
+        <td>{{ p.ticker }}</td>
+        <td><span class="pill {{ 'good' if p.side == 'yes' else 'warning' }}">{{ p.side | upper }}</span></td>
+        <td>{{ p.count }}</td>
+        <td>{{ "%.0f" | format(p.price_cents) }}¢</td>
+        <td>{{ money(p.cost) }}</td>
+        <td>{{ prob(p.model_win_probability) }}</td>
+        <td>{% if p.mark_cents is none %}—{% else %}{{ p.mark_cents }}¢{% endif %}</td>
+        <td>{% if p.unrealized_pnl is none %}—{% else %}{{ signed(p.unrealized_pnl) }}{% endif %}</td>
+        <td>{% if p.seconds_left is none %}—{% elif p.seconds_left == 0 %}awaiting settlement{% else %}{{ p.seconds_left // 60 }}m {{ "%02d" | format(p.seconds_left % 60) }}s{% endif %}</td>
+        <td class="muted">{{ clock(p.entered_at) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <div class="muted">No open positions.</div>
+  {% endif %}
+
+  <div class="subhead">Orders &amp; fills (last {{ a.orders | length }})</div>
+  {% if a.orders %}
+  <table>
+    <thead><tr>
+      <th>Time</th><th>Ticker</th><th>Side</th><th>Filled / requested</th><th>Price</th><th>Fee</th>
+      <th>Status</th><th>Outcome</th><th>Net PnL</th><th>Order id</th>
+    </tr></thead>
+    <tbody>
+      {% for o in a.orders %}
+      <tr>
+        <td class="muted">{{ clock(o.at) }}</td>
+        <td>{{ o.ticker }}</td>
+        <td><span class="pill {{ 'good' if o.side == 'yes' else 'warning' }}">{{ o.side | upper }}</span></td>
+        <td>{{ o.filled }} / {{ o.requested }}</td>
+        <td>{% if o.price_cents is none %}—{% else %}{{ "%.0f" | format(o.price_cents) }}¢{% endif %}</td>
+        <td>{{ money(o.fees) }}</td>
+        <td>{{ o.status }}</td>
+        <td>{% if o.outcome == "won" %}<span class="pill good">✓ won</span>{% elif o.outcome == "lost" %}<span class="pill critical">✕ lost</span>{% else %}<span class="muted">open</span>{% endif %}</td>
+        <td>{% if o.pnl is none %}—{% else %}{{ signed(o.pnl) }}{% endif %}</td>
+        <td class="muted">{{ (o.order_id or "—")[:14] }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <div class="muted">No orders yet. Resting orders are cancelled immediately, so there are never open orders: every order is either filled or cancelled.</div>
+  {% endif %}
+
+  <div class="subhead">LLM decisions (last {{ a.decisions | length }})</div>
+  {% if a.decisions %}
+  <table>
+    <thead><tr>
+      <th>Time</th><th>Ticker</th><th>Side @ ask</th><th>Edge</th><th>Model P(yes)</th><th>LLM P(yes)</th>
+      <th>Confidence</th><th>Verdict</th><th>Reason</th><th>Cost</th>
+    </tr></thead>
+    <tbody>
+      {% for d in a.decisions %}
+      <tr>
+        <td class="muted">{{ clock(d.at) }}</td>
+        <td>{{ d.ticker }}<div class="muted">{{ d.seconds_remaining // 60 }}m {{ "%02d" | format(d.seconds_remaining % 60) }}s left</div></td>
+        <td>{% if d.side %}{{ d.side | upper }} @ {{ d.ask_cents }}¢{% else %}—{% endif %}</td>
+        <td>{{ "%.1f" | format(d.edge * 100) }} pts</td>
+        <td>{{ prob(d.model_probability) }}</td>
+        <td>{{ prob(d.llm_probability) }}</td>
+        <td>{{ prob(d.confidence) }}</td>
+        <td>
+          {% if d.decision == "trade" %}<span class="pill good">✓ traded</span>
+          {% elif d.approved %}<span class="pill warning">approved · not traded</span>
+          {% else %}<span class="pill critical">✕ vetoed</span>{% endif %}
+        </td>
+        <td class="reason">
+          {% if d.decision == "skip" and d.approved and d.skip_reason %}<div>{{ d.skip_reason | replace("_", " ") }}</div>{% endif %}
+          {% if d.reasoning %}
+          <details><summary>{{ d.reasoning[:110] }}{% if d.reasoning | length > 110 %}…{% endif %}</summary>{{ d.reasoning }}</details>
+          {% endif %}
+          {% if d.risk_signals %}<div class="signals">{% for sig in d.risk_signals %}<span class="pill warning">{{ sig }}</span>{% endfor %}</div>{% endif %}
+        </td>
+        <td>{% if d.cost_usd is none %}—{% else %}${{ "%.4f" | format(d.cost_usd) }}{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <div class="muted">No LLM evaluations yet.</div>
+  {% endif %}
+  {% endif %}
+</section>

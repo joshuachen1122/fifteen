@@ -161,3 +161,155 @@ async def compute_stats(
         pnl_after_llm=total_pnl - llm_cost,
         llm_cost_pct_of_pnl=_pct(llm_cost, total_pnl) if total_pnl > 0 else None,
     )
+
+
+class OpenPosition(BaseModel):
+    ticker: str
+    side: str
+    count: int
+    price_cents: float
+    cost: float  # USD including fees
+    entered_at: datetime
+    expires_at: Optional[datetime]
+    seconds_left: Optional[int]
+    model_win_probability: Optional[float]
+    mark_cents: Optional[int]  # best bid on our side: what we could sell for now
+    unrealized_pnl: Optional[float]  # USD, after the entry fee, if sold at the mark
+
+
+class OrderFill(BaseModel):
+    at: datetime
+    ticker: str
+    side: str
+    requested: int
+    filled: int
+    price_cents: Optional[float]
+    fees: float
+    status: str
+    order_id: Optional[str]
+    outcome: Optional[str]  # "won" | "lost" | None while open
+    pnl: Optional[float]
+
+
+class Decision(BaseModel):
+    at: datetime
+    ticker: str
+    side: Optional[str]
+    ask_cents: Optional[int]
+    seconds_remaining: int
+    edge: float
+    model_probability: float  # P(YES)
+    llm_probability: Optional[float]  # P(YES)
+    confidence: Optional[float]
+    approved: Optional[bool]
+    decision: str  # "trade" | "skip"
+    skip_reason: Optional[str]
+    reasoning: Optional[str]
+    risk_signals: list[str]
+    cost_usd: Optional[float]
+
+
+class AgentActivity(BaseModel):
+    updated_at: datetime
+    positions: list[OpenPosition]
+    orders: list[OrderFill]
+    decisions: list[Decision]
+
+
+def _aware(moment: Optional[datetime]) -> Optional[datetime]:
+    return moment if moment is None or moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+async def compute_activity(
+    session: AsyncSession,
+    *,
+    now: datetime,
+    is_paper: bool,
+    books: dict[str, tuple[Optional[int], Optional[int]]],  # ticker -> (best yes bid, best yes ask)
+    limit: int = 20,
+) -> AgentActivity:
+    open_rows = (
+        await session.exec(
+            select(TradeRecord)
+            .where(
+                TradeRecord.is_paper == is_paper,
+                TradeRecord.filled_count > 0,
+                col(TradeRecord.settled_yes).is_(None),
+            )
+            .order_by(col(TradeRecord.entry_time).desc())
+        )
+    ).all()
+    positions = []
+    for r in open_rows:
+        yes_bid, yes_ask = books.get(r.ticker, (None, None))
+        mark = yes_bid if r.side == "yes" else (None if yes_ask is None else 100 - yes_ask)
+        price = r.avg_fill_price_cents or 0.0
+        expires = _aware(r.expiration_time)
+        p_yes = r.model_probability
+        positions.append(
+            OpenPosition(
+                ticker=r.ticker,
+                side=r.side or "",
+                count=r.filled_count,
+                price_cents=price,
+                cost=(price * r.filled_count + r.fees_cents) / 100,
+                entered_at=_aware(r.entry_time) or now,
+                expires_at=expires,
+                seconds_left=max(int((expires - now).total_seconds()), 0) if expires else None,
+                model_win_probability=None if p_yes is None else (p_yes if r.side == "yes" else 1 - p_yes),
+                mark_cents=mark,
+                unrealized_pnl=None if mark is None else ((mark - price) * r.filled_count - r.fees_cents) / 100,
+            )
+        )
+
+    order_rows = (
+        await session.exec(
+            select(TradeRecord)
+            .where(TradeRecord.is_paper == is_paper, col(TradeRecord.side).is_not(None))
+            .order_by(col(TradeRecord.entry_time).desc())
+            .limit(limit)
+        )
+    ).all()
+    orders = [
+        OrderFill(
+            at=_aware(r.entry_time) or now,
+            ticker=r.ticker,
+            side=r.side or "",
+            requested=r.count,
+            filled=r.filled_count,
+            price_cents=r.avg_fill_price_cents,
+            fees=r.fees_cents / 100,
+            status=r.status,
+            order_id=r.kalshi_order_id,
+            outcome=None if r.realized_pnl_cents is None else ("won" if r.settled_yes == (r.side == "yes") else "lost"),
+            pnl=None if r.realized_pnl_cents is None else r.realized_pnl_cents / 100,
+        )
+        for r in order_rows
+    ]
+
+    trace_rows = (
+        await session.exec(
+            select(EvaluationTraceRecord).order_by(col(EvaluationTraceRecord.created_at).desc()).limit(limit)
+        )
+    ).all()
+    decisions = [
+        Decision(
+            at=_aware(r.created_at) or now,
+            ticker=r.ticker,
+            side=r.proposed_side,
+            ask_cents=r.proposed_ask_cents,
+            seconds_remaining=r.seconds_remaining,
+            edge=r.gross_edge,
+            model_probability=r.model_probability,
+            llm_probability=r.llm_adjusted_probability,
+            confidence=r.llm_confidence_score,
+            approved=r.llm_should_bet,
+            decision=r.decision,
+            skip_reason=r.skip_reason,
+            reasoning=r.llm_reasoning,
+            risk_signals=list(r.llm_risk_signals or []),
+            cost_usd=r.llm_cost_usd,
+        )
+        for r in trace_rows
+    ]
+    return AgentActivity(updated_at=now, positions=positions, orders=orders, decisions=decisions)

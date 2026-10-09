@@ -445,3 +445,38 @@ async def test_stats_panel_renders(db: Database) -> None:
     assert page.status_code == 200
     for text in ("Total PnL", "Bets made", "LLM calls", "Projected / month", "PAPER", "vetoed no material change"):
         assert text in page.text
+
+
+async def test_activity_panel_shows_positions_fills_and_llm_verdicts(db: Database) -> None:
+    import httpx
+
+    from web.app import create_app
+
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.restore()
+    await agent.handle_candidate(yes_candidate(agent))  # approved and filled
+    vetoing = make_agent(db, clock, FakeEvaluator(should_bet=False))
+    await vetoing.restore()
+    other = yes_candidate(vetoing).model_copy(update={"ticker": "KXBTC15M-26OCT091430-B82500"})
+    await vetoing.handle_candidate(other)
+    await agent.refresh_stats()
+
+    activity = agent.dashboard.activity
+    assert activity is not None
+    [position] = activity.positions
+    assert (position.ticker, position.side, position.mark_cents) == (TICKER, "yes", YES_BID)
+    [row] = [r for r in await trade_rows(db) if r.side]
+    assert position.unrealized_pnl == pytest.approx(((YES_BID - YES_ASK) * row.filled_count - row.fees_cents) / 100)
+    assert [o.status for o in activity.orders] == ["filled"]
+    assert [(d.side, d.ask_cents, d.decision, d.approved) for d in activity.decisions] == [
+        ("yes", YES_ASK, "skip", False),
+        ("yes", YES_ASK, "trade", True),
+    ]
+
+    app = create_app(agent.dashboard, db.engine)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http:
+        page = await http.get("/partials/activity")
+    assert page.status_code == 200
+    for text in ("Open positions (1)", "✓ traded", "✕ vetoed", "macro news window", "Macro news window", TICKER):
+        assert text in page.text

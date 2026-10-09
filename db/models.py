@@ -80,6 +80,8 @@ class EvaluationTraceRecord(SQLModel, table=True):
     # Kalshi quote at evaluation time (MarketQuote)
     yes_bid: Optional[int] = None
     yes_ask: Optional[int] = None
+    proposed_side: Optional[str] = None  # "yes" | "no"
+    proposed_ask_cents: Optional[int] = None  # ask on the proposed side
 
     # Quant model output (FairValueOutput)
     model_probability: float

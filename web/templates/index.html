@@ -62,6 +62,10 @@
     summary { cursor: pointer; color: var(--text-muted); font-size: 12px; }
     .error { color: var(--status-critical); }
     .empty { color: var(--text-muted); padding: 24px 0; text-align: center; }
+    .subhead { font-size: 12px; font-weight: 600; color: var(--text-secondary); margin: 18px 0 6px; }
+    td.reason { white-space: normal; text-align: left; max-width: 520px; color: var(--text-secondary); }
+    td.reason details { margin: 0; }
+    .signals { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 
     /* Charts */
     .chart { position: relative; }
@@ -95,6 +99,7 @@
     {% include "partials/spot.html" %}
     {% include "partials/backtest.html" %}
     {% include "partials/markets.html" %}
+    {% include "partials/activity.html" %}
   </main>
   <script>
     // Delegated hover layer for server-rendered line charts; survives HTMX swaps.
