@@ -745,3 +745,29 @@ def test_signer_accepts_single_line_pem_with_escaped_newlines() -> None:
     ).decode()
     signer = KalshiRequestSigner.from_pem("key-id", pem.replace("\n", "\\n"))
     assert signer.headers("GET", "/trade-api/v2/markets")["KALSHI-ACCESS-KEY"] == "key-id"
+
+
+async def test_scanner_reprices_only_when_top_of_book_moves_or_interval_elapses() -> None:
+    now = [NOW]
+    pricer = StubPricer(0.60)
+    scanner = KalshiOrderBookScanner(
+        FakeKalshiClient([market()]),  # type: ignore[arg-type]
+        spot_provider=lambda: SPOT,
+        fair_value_fn=pricer,
+        params=StrategyParameters(min_gross_edge=0.035),
+        clock=lambda: now[0],
+    )
+    await scanner.refresh_markets()
+    scanner.handle_message(snapshot(yes=[[40, 50], [30, 10]], no=[[55, 30]]))
+    assert len(pricer.calls) == 1
+
+    scanner.handle_message(delta(30, 5, "yes", seq=2))  # below the touch: no re-price
+    scanner.handle_message(delta(30, -3, "yes", seq=3))
+    assert len(pricer.calls) == 1
+
+    scanner.handle_message(delta(41, 5, "yes", seq=4))  # new best YES bid
+    assert len(pricer.calls) == 2
+
+    now[0] += timedelta(seconds=1.5)  # spot may have moved: periodic re-price
+    scanner.handle_message(delta(30, 1, "yes", seq=5))
+    assert len(pricer.calls) == 3

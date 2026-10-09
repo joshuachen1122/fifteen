@@ -119,6 +119,7 @@ class TradingAgent:
             fair_value_fn=self.fair_value,
             params=self.state_manager.params,
             on_candidate=self.on_candidate,
+            idle_poll_seconds=5.0,  # the next contract opens a few seconds after the last one closes
             clock=clock,
         )
         feed.add_listener(self._on_tick)

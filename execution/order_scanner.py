@@ -195,6 +195,7 @@ class KalshiOrderBookScanner:
         reconnect_delay: float = 1.0,
         max_reconnect_delay: float = 30.0,
         idle_poll_seconds: float = 15.0,
+        reprice_interval_seconds: float = 1.0,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._client = client
@@ -207,6 +208,7 @@ class KalshiOrderBookScanner:
         self._reconnect_delay = reconnect_delay
         self._max_reconnect_delay = max_reconnect_delay
         self._idle_poll_seconds = idle_poll_seconds
+        self._reprice_interval = reprice_interval_seconds
         self._clock = clock
 
         self.candidates: asyncio.Queue[ScanCandidate] = asyncio.Queue(maxsize=queue_maxsize)
@@ -214,6 +216,7 @@ class KalshiOrderBookScanner:
         self.books: dict[str, OrderBook] = {}
         self._last_seq: dict[int, int] = {}
         self._last_emitted: dict[tuple[str, str], tuple[int, int]] = {}
+        self._last_priced: dict[str, tuple[tuple[int | None, int | None], datetime]] = {}
         self._msg_ids = itertools.count(1)
         self._stop = asyncio.Event()
 
@@ -229,6 +232,7 @@ class KalshiOrderBookScanner:
         self.books = {m.ticker: OrderBook(m.ticker) for m in markets}
         self._last_seq.clear()
         self._last_emitted.clear()
+        self._last_priced.clear()
         return markets
 
     def subscribe_message(self) -> dict[str, Any]:
@@ -269,6 +273,14 @@ class KalshiOrderBookScanner:
             book.apply_snapshot(msg, now)
         else:
             book.apply_delta(msg, now)
+        # Busy books send ~1,000 deltas/s, almost all below the top of book. Re-price only when the
+        # touch moves, or periodically so spot moves are still picked up; pricing every delta starves
+        # the event loop until the WebSocket keepalive times out.
+        top = (book.best_yes_bid, book.best_yes_ask)
+        last = self._last_priced.get(book.ticker)
+        if last is not None and last[0] == top and (now - last[1]).total_seconds() < self._reprice_interval:
+            return []
+        self._last_priced[book.ticker] = (top, now)
         return self._new_candidates(book.ticker)
 
     def evaluate(self, ticker: str) -> list[ScanCandidate]:
