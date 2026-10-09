@@ -78,6 +78,8 @@ class KalshiRequestSigner:
     @classmethod
     def from_pem(cls, key_id: str, pem: bytes | str, password: bytes | None = None) -> KalshiRequestSigner:
         data = pem.encode() if isinstance(pem, str) else pem
+        # Single-line env vars / Fly secrets often carry the PEM with literal "\n" escapes.
+        data = data.strip().replace(b"\\n", b"\n")
         key = serialization.load_pem_private_key(data, password=password)
         if not isinstance(key, rsa.RSAPrivateKey):
             raise ValueError("Kalshi API keys must be RSA private keys")

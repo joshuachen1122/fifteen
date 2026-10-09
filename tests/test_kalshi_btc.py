@@ -698,3 +698,12 @@ def test_from_env_accepts_production_alias() -> None:
     client = KalshiClient.from_env({"KALSHI_ENV": "production"})
     assert client.base_url == "https://api.elections.kalshi.com/trade-api/v2"
     assert client.is_paper
+
+
+def test_signer_accepts_single_line_pem_with_escaped_newlines() -> None:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()
+    ).decode()
+    signer = KalshiRequestSigner.from_pem("key-id", pem.replace("\n", "\\n"))
+    assert signer.headers("GET", "/trade-api/v2/markets")["KALSHI-ACCESS-KEY"] == "key-id"
