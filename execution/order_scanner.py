@@ -19,6 +19,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel
@@ -89,34 +90,50 @@ def load_default_fair_value_fn() -> FairValueFn:
     return fn  # type: ignore[no-any-return]
 
 
-def _levels(msg: dict[str, Any], side: str) -> list[tuple[int, int]]:
+_QTY_EPSILON = 1e-6  # contract counts are fixed-point (e.g. "4.85")
+
+
+def _dollars_to_cents(price: str | float) -> int:
+    """Bucket a bid price into whole cents, rounding down (Kalshi quotes sub-penny levels such as
+    "0.0010"). Flooring bids is conservative: the implied opposite-side ask, 100 - bid, rounds up."""
+    return int(Decimal(str(price)) * 100)
+
+
+def _levels(msg: dict[str, Any], side: str) -> list[tuple[int, float]]:
     if msg.get(side) is not None:
-        return [(int(price), int(qty)) for price, qty in msg[side]]
-    dollars = msg.get(f"{side}_dollars") or []
-    return [(round(float(price) * 100), int(float(qty))) for price, qty in dollars]
+        return [(int(price), float(qty)) for price, qty in msg[side]]
+    dollars = msg.get(f"{side}_dollars_fp") or msg.get(f"{side}_dollars") or []
+    return [(_dollars_to_cents(price), float(qty)) for price, qty in dollars]
+
+
+def _aggregate(levels: list[tuple[int, float]]) -> dict[int, float]:
+    book: dict[int, float] = {}
+    for price, qty in levels:
+        book[price] = book.get(price, 0.0) + qty
+    return {p: q for p, q in book.items() if q > _QTY_EPSILON}
 
 
 class OrderBook:
     def __init__(self, ticker: str) -> None:
         self.ticker = ticker
-        self.yes_bids: dict[int, int] = {}
-        self.no_bids: dict[int, int] = {}
+        self.yes_bids: dict[int, float] = {}
+        self.no_bids: dict[int, float] = {}
         self.updated_at: datetime | None = None
 
     def apply_snapshot(self, msg: dict[str, Any], ts: datetime) -> None:
-        self.yes_bids = {p: q for p, q in _levels(msg, "yes") if q > 0}
-        self.no_bids = {p: q for p, q in _levels(msg, "no") if q > 0}
+        self.yes_bids = _aggregate(_levels(msg, "yes"))
+        self.no_bids = _aggregate(_levels(msg, "no"))
         self.updated_at = ts
 
     def apply_delta(self, msg: dict[str, Any], ts: datetime) -> None:
         if msg.get("price") is not None:
             price = int(msg["price"])
         else:
-            price = round(float(msg["price_dollars"]) * 100)
-        delta = int(float(msg["delta"] if msg.get("delta") is not None else msg["delta_fp"]))
+            price = _dollars_to_cents(msg["price_dollars"])
+        delta = float(msg["delta"] if msg.get("delta") is not None else msg["delta_fp"])
         book = self.yes_bids if msg["side"] == "yes" else self.no_bids
-        qty = book.get(price, 0) + delta
-        if qty > 0:
+        qty = book.get(price, 0.0) + delta
+        if qty > _QTY_EPSILON:
             book[price] = qty
         else:
             book.pop(price, None)
@@ -139,6 +156,12 @@ class OrderBook:
     def best_no_ask(self) -> int | None:
         best_yes = self.best_yes_bid
         return None if best_yes is None else 100 - best_yes
+
+    @property
+    def is_crossed(self) -> bool:
+        """A YES bid at or above the YES ask cannot rest on Kalshi; it means the local book is wrong."""
+        bid, ask = self.best_yes_bid, self.best_yes_ask
+        return bid is not None and ask is not None and bid >= ask
 
     @property
     def imbalance(self) -> float:
@@ -256,6 +279,9 @@ class KalshiOrderBookScanner:
             return []
         yes_bid, yes_ask = book.best_yes_bid, book.best_yes_ask
         if yes_bid is None or yes_ask is None:
+            return []
+        if book.is_crossed:
+            logger.warning("%s book is crossed (bid %dc >= ask %dc); not pricing it", ticker, yes_bid, yes_ask)
             return []
 
         now = self._clock()

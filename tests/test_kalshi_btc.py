@@ -447,6 +447,35 @@ def test_order_book_parses_dollar_fields() -> None:
     assert book.best_yes_bid == 39
 
 
+def test_order_book_parses_production_fixed_point_snapshot() -> None:
+    # Shapes captured from the production orderbook_delta channel on 2026-10-09.
+    book = OrderBook(TICKER)
+    book.apply_snapshot(
+        {
+            "yes_dollars_fp": [["0.0010", "643283.40"], ["0.0040", "27594.00"], ["0.2400", "44.30"], ["0.2500", "12.00"]],
+            "no_dollars_fp": [["0.7300", "3051.00"], ["0.7400", "9.50"]],
+        },
+        NOW,
+    )
+    assert (book.best_yes_bid, book.best_yes_ask) == (25, 26)
+    assert book.yes_bids[0] == pytest.approx(643283.40 + 27594.00)  # sub-penny levels share the 0c bucket
+
+    # Fractional deltas must net to zero exactly, not leave a phantom level behind.
+    book.apply_delta({"price_dollars": "0.2500", "delta_fp": "-4.85", "side": "yes"}, NOW)
+    book.apply_delta({"price_dollars": "0.2500", "delta_fp": "-7.15", "side": "yes"}, NOW)
+    assert book.best_yes_bid == 24
+    book.apply_delta({"price_dollars": "0.2900", "delta_fp": "0.10", "side": "yes"}, NOW)
+    assert book.best_yes_bid == 29  # "0.2900" must not float-round down to 28
+
+
+def test_sub_penny_bids_round_down_so_asks_round_up() -> None:
+    book = OrderBook(TICKER)
+    book.apply_snapshot({"yes_dollars_fp": [["0.2450", "10"]], "no_dollars_fp": [["0.7450", "10"]]}, NOW)
+    assert (book.best_yes_bid, book.best_yes_ask, book.best_no_ask) == (24, 26, 76)
+
+
+
+
 def test_empty_order_book_has_no_quotes() -> None:
     book = OrderBook(TICKER)
     assert book.best_yes_ask is None and book.best_no_ask is None
@@ -574,6 +603,15 @@ async def test_scanner_flags_underpriced_yes() -> None:
     assert state.current_spot_price == SPOT.spot_price
     assert state.historical_volatility == SPOT.historical_volatility
     assert state.order_book_imbalance == pytest.approx((50 - 30) / 80)
+
+
+async def test_scanner_never_prices_a_crossed_book() -> None:
+    # 50c YES bid against a 31c YES ask (69c NO bid): the desync seen live before the fp fix.
+    scanner, pricer = make_scanner(probability=0.25)
+    await scanner.refresh_markets()
+    assert scanner.handle_message(snapshot(yes=[[50, 10]], no=[[69, 10]])) == []
+    assert scanner.books[scanner.markets.popitem()[0]].is_crossed
+    assert pricer.calls == []
 
 
 async def test_scanner_flags_underpriced_no() -> None:
