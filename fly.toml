@@ -15,8 +15,8 @@ kill_timeout = "30s"
   DATABASE_URL = "sqlite+aiosqlite:////data/agent.db"
   PORT = "8080"
   LOG_LEVEL = "INFO"
-  KALSHI_ENV = "demo"
-  TRADING_ENABLED = "false"  # flip to "true" (with KALSHI_ENV=prod) only for real-money trading
+  KALSHI_ENV = "prod"         # production market data; the Kalshi key is a production key
+  TRADING_ENABLED = "false"  # paper fills only; flip to "true" for real-money orders
 
 # SQLite lives on the volume, so run exactly one machine and never auto-stop it.
 [mounts]

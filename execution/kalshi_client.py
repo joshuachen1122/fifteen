@@ -236,6 +236,7 @@ class KalshiClient:
         env = dict(os.environ) if env is None else env
         trading_enabled = env.get("TRADING_ENABLED", "false").strip().lower() in _TRUTHY
         kalshi_env = env.get("KALSHI_ENV", "demo").strip().lower()
+        kalshi_env = {"production": "prod"}.get(kalshi_env, kalshi_env)
         if kalshi_env not in ("demo", "prod"):
             raise ValueError(f"KALSHI_ENV must be 'demo' or 'prod', got {kalshi_env!r}")
 

@@ -692,3 +692,9 @@ def test_missing_pricing_module_gives_clear_error(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setitem(sys.modules, "pricing.btc_digital_option", None)
     with pytest.raises(ImportError, match="fair_value_fn"):
         KalshiOrderBookScanner(FakeKalshiClient([]), spot_provider=lambda: SPOT)  # type: ignore[arg-type]
+
+
+def test_from_env_accepts_production_alias() -> None:
+    client = KalshiClient.from_env({"KALSHI_ENV": "production"})
+    assert client.base_url == "https://api.elections.kalshi.com/trade-api/v2"
+    assert client.is_paper
