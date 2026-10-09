@@ -129,7 +129,7 @@ async def test_candidate_flows_through_llm_and_fee_aware_kelly_to_paper_fill(db:
 
     await agent.handle_candidate(candidate)
 
-    expected = RiskEngine(100_000, now=T0, max_order_cost_cents=100, daily_spend_limit_cents=10_000).size_order(
+    expected = RiskEngine(100_000, now=T0).size_order(  # paper sizing is uncapped
         candidate.fair_value, "yes", YES_ASK, agent.params, probability_override=candidate.fair_value.model_probability
     )
     assert expected is not None and expected.count > 0
@@ -551,20 +551,31 @@ def make_live_agent(db: Database, clock: Clock, client: FakeLiveClient, **settin
     return agent
 
 
-async def test_every_paper_trade_respects_the_per_trade_cap(db: Database) -> None:
+async def test_paper_trades_are_uncapped_but_live_trades_respect_the_per_trade_cap(db: Database) -> None:
     clock = Clock(T0)
-    agent = make_agent(db, clock, FakeEvaluator())
-    await agent.restore()
-    await agent.handle_candidate(yes_candidate(agent))
-    [row] = await trade_rows(db)
-    assert row.filled_count >= 1
-    assert row.filled_count * YES_ASK + row.fees_cents <= 100
+    paper = make_agent(db, clock, FakeEvaluator())
+    await paper.restore()
+    assert paper.risk is not None and paper.risk.max_order_cost_cents is None
+    await paper.handle_candidate(yes_candidate(paper))
+    [paper_row] = [r for r in await trade_rows(db) if r.side]
+    assert paper_row.filled_count * YES_ASK + paper_row.fees_cents > 100
+
+    live = make_live_agent(db, clock, FakeLiveClient(shard_balance_cents=100_000))
+    await live.load_controls()
+    await live.restore()
+    await live.switch_mode(True)
+    await live.handle_candidate(yes_candidate(live))  # same contract paper already traded
+    [live_row] = [r for r in await trade_rows(db) if r.side and not r.is_paper]
+    assert set(live._trade_rows.values()) == {live_row.id} and len(live._positions) == 1
+    assert 1 <= live_row.filled_count and live_row.filled_count * YES_ASK + live_row.fees_cents <= 100
 
 
-async def test_daily_cap_blocks_trades_once_spent(db: Database) -> None:
+async def test_live_daily_cap_blocks_trades_once_spent(db: Database) -> None:
     clock = Clock(T0)
-    agent = make_agent(db, clock, FakeEvaluator(), max_daily_trade_usd=1.00)
+    agent = make_live_agent(db, clock, FakeLiveClient(shard_balance_cents=100_000), max_daily_trade_usd=1.00)
+    await agent.load_controls()
     await agent.restore()
+    await agent.switch_mode(True)
     await agent.handle_candidate(yes_candidate(agent))
     other = yes_candidate(agent).model_copy(update={"ticker": "KXBTC15M-26OCT091430-B82500"})
     await agent.handle_candidate(other)
@@ -572,8 +583,9 @@ async def test_daily_cap_blocks_trades_once_spent(db: Database) -> None:
     assert len(traded) == 1
     assert agent.risk is not None and agent.risk.remaining_daily_spend_cents(clock.now) < YES_ASK
 
-    restarted = make_agent(db, clock, FakeEvaluator(), max_daily_trade_usd=1.00)
-    await restarted.restore()  # today's spend survives a restart
+    restarted = make_live_agent(db, clock, FakeLiveClient(shard_balance_cents=100_000), max_daily_trade_usd=1.00)
+    await restarted.load_controls()
+    await restarted.restore()  # today's live spend survives a restart
     assert restarted.risk is not None and restarted.risk.spent_today_cents == agent.risk.spent_today_cents
 
 
@@ -657,13 +669,17 @@ async def test_limits_can_be_changed_at_runtime_and_persist(db: Database) -> Non
     agent = make_agent(db, clock, FakeEvaluator())
     await agent.restore()
     await agent.set_limits(2.50, 40.00)
-    assert agent.risk is not None and (agent.risk.max_order_cost_cents, agent.risk.daily_spend_limit_cents) == (250, 4000)
+    assert agent.risk is not None and agent.risk.max_order_cost_cents is None  # paper stays uncapped
     with pytest.raises(ValueError):
         await agent.set_limits(5.00, 1.00)
 
-    restarted = make_agent(db, clock, FakeEvaluator())
+    restarted = make_live_agent(db, clock, FakeLiveClient())
     await restarted.load_controls()
     assert (restarted.max_trade_cents, restarted.max_daily_cents) == (250, 4000)
+    await restarted.restore()
+    await restarted.switch_mode(True)
+    assert restarted.risk is not None
+    assert (restarted.risk.max_order_cost_cents, restarted.risk.daily_spend_limit_cents) == (250, 4000)
 
 
 async def test_dashboard_is_password_protected_and_drives_the_controls(db: Database) -> None:
@@ -726,3 +742,30 @@ async def test_sub_penny_live_fill_is_booked_at_one_cent_and_recorded_exactly(db
     assert position.price_cents == 1  # never 0c
     [row] = [r for r in await trade_rows(db) if r.side]
     assert row.avg_fill_price_cents == pytest.approx(0.2)
+
+
+async def test_dashboard_shows_only_the_current_modes_activity(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_live_agent(db, clock, FakeLiveClient(shard_balance_cents=100_000))
+    await agent.load_controls()
+    await agent.restore()
+    await agent.handle_candidate(yes_candidate(agent))  # paper: LLM call + trade
+    await agent.refresh_stats()
+    assert agent.dashboard.stats is not None and agent.dashboard.stats.llm_calls == 1
+    assert agent.dashboard.activity is not None and len(agent.dashboard.activity.decisions) == 1
+
+    await agent.switch_mode(True)
+    await agent.refresh_stats()
+    stats, activity = agent.dashboard.stats, agent.dashboard.activity
+    assert stats is not None and activity is not None
+    assert (stats.mode, stats.llm_calls, stats.bets_made, stats.total_pnl) == ("live", 0, 0, 0.0)
+    assert (activity.decisions, activity.orders, activity.positions) == ([], [], [])
+    assert stats.llm_spend_today_all_modes == pytest.approx(CALL_USAGE.cost_usd)  # budget spans both modes
+
+    advance(agent, clock, timedelta(seconds=61))  # the per-contract LLM cooldown spans modes
+    await agent.handle_candidate(yes_candidate(agent))  # live
+    await agent.refresh_stats()
+    assert agent.dashboard.stats is not None and agent.dashboard.activity is not None
+    assert agent.dashboard.stats.llm_calls == 1 and agent.dashboard.stats.bets_made == 1
+    assert [d.decision for d in agent.dashboard.activity.decisions] == ["trade"]
+    assert [p.ticker for p in agent.dashboard.activity.positions] == [TICKER]

@@ -11,7 +11,7 @@
     {% if stats.halted %}<span class="pill critical">✕ Daily drawdown halt</span>{% endif %}
     {% if stats.budget_used_pct >= 100 %}<span class="pill critical">✕ LLM budget exhausted: no new trades today</span>
     {% elif stats.budget_used_pct >= 80 %}<span class="pill warning">LLM budget {{ pct(stats.budget_used_pct, 0) }} used</span>{% endif %}
-    <span class="muted">Updated {{ stats.updated_at.strftime("%H:%M:%S") }} UTC · PnL is realized and net of Kalshi fees</span>
+    <span class="muted">Showing {{ stats.mode }} activity only · updated {{ stats.updated_at.strftime("%H:%M:%S") }} UTC · PnL is realized and net of Kalshi fees</span>
   </div>
 
   <div class="tiles">
@@ -37,7 +37,7 @@
     <div class="tile"><div class="label">Screened out free</div><div class="value">{{ "{:,}".format(stats.candidates_screened) }}</div>
       <div class="muted">never sent to the LLM</div></div>
     <div class="tile"><div class="label">LLM spend today</div><div class="value">{{ money(stats.llm_cost_today) }}</div>
-      <div class="muted">of {{ money(stats.llm_daily_budget) }} budget ({{ pct(stats.budget_used_pct, 0) }})</div></div>
+      <div class="muted">budget {{ money(stats.llm_spend_today_all_modes) }} of {{ money(stats.llm_daily_budget) }} used, all modes ({{ pct(stats.budget_used_pct, 0) }})</div></div>
     <div class="tile"><div class="label">Projected / month</div>
       <div class="value">{% if stats.projected_monthly_cost is none %}—{% else %}{{ money(stats.projected_monthly_cost) }}{% endif %}</div>
       <div class="muted">{% if stats.projection_basis_hours %}from last {{ "%.1f" | format(stats.projection_basis_hours) }}h{% else %}no calls yet{% endif %}</div></div>

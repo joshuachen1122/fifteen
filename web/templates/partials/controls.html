@@ -9,10 +9,15 @@
       <span class="pill warning">PAPER · simulated fills</span>
     {% endif %}
     <span class="muted">
-      Spent today {{ "${:,.2f}".format(c.spent_today_usd) }} of {{ "${:,.2f}".format(c.max_daily_trade_usd) }}
-      {% if c.remaining_today_usd is not none %}({{ "${:,.2f}".format(c.remaining_today_usd) }} left){% endif %}
-      · max {{ "${:,.2f}".format(c.max_trade_usd) }} per trade (price + fee)
-      {% if c.cash_usd is not none %} · {{ "cash on exchange" if c.mode == "live" else "paper cash" }} {{ "${:,.2f}".format(c.cash_usd) }}{% endif %}
+      {% if c.mode == "live" %}
+        Spent today {{ "${:,.2f}".format(c.spent_today_usd) }} of {{ "${:,.2f}".format(c.max_daily_trade_usd) }}
+        {% if c.remaining_today_usd is not none %}({{ "${:,.2f}".format(c.remaining_today_usd) }} left){% endif %}
+        · max {{ "${:,.2f}".format(c.max_trade_usd) }} per trade (price + fee)
+        {% if c.cash_usd is not none %} · cash on exchange {{ "${:,.2f}".format(c.cash_usd) }}{% endif %}
+      {% else %}
+        Paper trades are uncapped (fractional Kelly only){% if c.cash_usd is not none %} · paper cash {{ "${:,.2f}".format(c.cash_usd) }}{% endif %}
+        · live caps: {{ "${:,.2f}".format(c.max_trade_usd) }} per trade, {{ "${:,.2f}".format(c.max_daily_trade_usd) }} per day
+      {% endif %}
     </span>
   </div>
   {% if c.error %}<div class="error" style="margin-bottom: 10px;">✕ {{ c.error }}</div>{% endif %}
@@ -20,9 +25,9 @@
 
   {% if c.editable %}
   <form hx-post="/controls/limits" hx-target="#controls-panel" hx-swap="outerHTML">
-    <label>Max per trade (USD)<input name="max_trade_usd" type="number" min="0.01" step="0.01" value="{{ '%.2f' | format(c.max_trade_usd) }}"></label>
-    <label>Max per day (USD)<input name="max_daily_trade_usd" type="number" min="0.01" step="0.01" value="{{ '%.2f' | format(c.max_daily_trade_usd) }}"></label>
-    <button type="submit" class="secondary-btn">Save caps</button>
+    <label>Live max per trade (USD)<input name="max_trade_usd" type="number" min="0.01" step="0.01" value="{{ '%.2f' | format(c.max_trade_usd) }}"></label>
+    <label>Live max per day (USD)<input name="max_daily_trade_usd" type="number" min="0.01" step="0.01" value="{{ '%.2f' | format(c.max_daily_trade_usd) }}"></label>
+    <button type="submit" class="secondary-btn">Save live caps</button>
     {% if c.mode == "live" %}
       <button type="button" hx-post="/controls/mode" hx-vals='{"mode": "paper"}' hx-target="#controls-panel" hx-swap="outerHTML">Switch to paper</button>
     {% elif c.live_blocked_reason %}

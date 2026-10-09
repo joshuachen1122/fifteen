@@ -190,8 +190,14 @@ class TradingAgent:
                     )
                 )
             ).all()
+            # Per-contract rows are per mode: a contract traded on paper must not block (or absorb)
+            # the record of a live trade on the same contract after a switch.
             active_rows = (
-                await session.exec(select(TradeRecord).where(col(TradeRecord.expiration_time) > now))
+                await session.exec(
+                    select(TradeRecord).where(
+                        col(TradeRecord.expiration_time) > now, TradeRecord.is_paper == self.client.is_paper
+                    )
+                )
             ).all()
             settled_pnl = sum(
                 r.realized_pnl_cents or 0
@@ -210,11 +216,12 @@ class TradingAgent:
         # them; a live Kalshi balance already reflects settlements but excludes open positions.
         starting = balance + settled_pnl if self.client.is_paper else balance + open_cost
         self._initial_bankroll_cents = starting - settled_pnl
+        # Spend caps protect real money only; paper keeps unrestricted Kelly sizing.
         self.risk = RiskEngine(
             starting,
             now=now,
-            max_order_cost_cents=self.max_trade_cents,
-            daily_spend_limit_cents=self.max_daily_cents,
+            max_order_cost_cents=None if self.client.is_paper else self.max_trade_cents,
+            daily_spend_limit_cents=None if self.client.is_paper else self.max_daily_cents,
         )
         for row in open_rows:
             assert row.id is not None and row.side is not None
@@ -234,12 +241,14 @@ class TradingAgent:
         await self._load_llm_spend(now)
 
         logger.info(
-            "restored %s bankroll: equity $%.2f, %d open position(s), spent today $%.2f of $%.2f",
+            "restored %s bankroll: equity $%.2f, %d open position(s)%s",
             "PAPER" if self.client.is_paper else f"LIVE (exchange {self.exchange_index})",
             self.risk.equity_cents / 100,
             len(self._positions),
-            self.risk.spent_today_cents / 100,
-            self.max_daily_cents / 100,
+            "" if self.client.is_paper else (
+                f", spent today ${self.risk.spent_today_cents / 100:.2f} of ${self.max_daily_cents / 100:.2f}"
+                f" (max ${self.max_trade_cents / 100:.2f}/trade)"
+            ),
         )
 
     async def _spent_today_cents(self, now: datetime) -> int:
@@ -303,6 +312,7 @@ class TradingAgent:
                 return
             self.client.trading_enabled = live
             await self._save_setting("trading_mode", "live" if live else "paper")
+            self.llm_screened.clear()  # dashboard counters are per mode
             await self.restore()
         logger.warning("switched to %s trading", "*** LIVE ***" if live else "PAPER")
 
@@ -314,7 +324,7 @@ class TradingAgent:
             self.max_daily_cents = round(max_daily_trade_usd * 100)
             await self._save_setting("max_trade_usd", f"{max_trade_usd:.2f}")
             await self._save_setting("max_daily_trade_usd", f"{max_daily_trade_usd:.2f}")
-            if self.risk is not None:
+            if self.risk is not None and self.is_live:
                 self.risk.max_order_cost_cents = self.max_trade_cents
                 self.risk.daily_spend_limit_cents = self.max_daily_cents
         logger.warning("spend caps set: $%.2f per trade, $%.2f per day", max_trade_usd, max_daily_trade_usd)
@@ -410,6 +420,7 @@ class TradingAgent:
                 open_exposure_cents=self.risk.open_exposure_cents,
                 halted=self.risk.is_trading_halted(now),
                 llm_daily_budget_usd=self.settings.llm_daily_budget_usd,
+                llm_spend_today_all_modes_usd=self.llm_spend_today(now),
                 llm_screened=dict(self.llm_screened),
             )
             self.dashboard.activity = await compute_activity(
@@ -688,6 +699,7 @@ class TradingAgent:
             yes_ask=c.quote.yes_ask,
             proposed_side=c.side,
             proposed_ask_cents=c.ask_cents,
+            is_paper=self.client.is_paper,
             model_probability=fv.model_probability,
             fair_cents=fv.fair_cents,
             gross_edge=c.edge,

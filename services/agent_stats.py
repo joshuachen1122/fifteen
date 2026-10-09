@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel
-from sqlalchemy import Integer, cast, func
+from sqlalchemy import Integer, and_, cast, func, or_
 from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -49,6 +49,7 @@ class AgentStats(BaseModel):
     llm_cost_total: float
     llm_cost_today: float
     llm_daily_budget: float
+    llm_spend_today_all_modes: float
     budget_used_pct: float
     avg_cost_per_call: Optional[float]
     projected_monthly_cost: Optional[float]
@@ -56,6 +57,12 @@ class AgentStats(BaseModel):
     cache_hit_pct: Optional[float]
     pnl_after_llm: float
     llm_cost_pct_of_pnl: Optional[float]
+
+
+def _mode_filter(is_paper: bool) -> Any:
+    """Decisions made in the given mode. Rows from before modes were recorded count as paper."""
+    column = col(EvaluationTraceRecord.is_paper)
+    return or_(column.is_(None), column.is_(True)) if is_paper else column.is_(False)
 
 
 def _pct(numerator: float, denominator: float) -> Optional[float]:
@@ -73,6 +80,7 @@ async def compute_stats(
     open_exposure_cents: int,
     halted: bool,
     llm_daily_budget_usd: float,
+    llm_spend_today_all_modes_usd: float,
     llm_screened: dict[str, int],
 ) -> AgentStats:
     bets = (
@@ -85,7 +93,7 @@ async def compute_stats(
     staked_cents = sum(round((b.avg_fill_price_cents or 0) * b.filled_count) for b in settled)
     wins = sum(1 for b in settled if (b.realized_pnl_cents or 0) > 0)
 
-    called = col(EvaluationTraceRecord.llm_cost_usd).is_not(None)
+    called = and_(col(EvaluationTraceRecord.llm_cost_usd).is_not(None), _mode_filter(is_paper))
     # Cast before summing: SQLAlchemy types SUM(boolean) as Boolean, which collapses any count to True.
     calls, approvals, traded, cost, uncached, cache_read, cache_write, first_call = (
         await session.exec(
@@ -155,7 +163,9 @@ async def compute_stats(
         llm_cost_total=llm_cost,
         llm_cost_today=float(cost_today),
         llm_daily_budget=llm_daily_budget_usd,
-        budget_used_pct=float(cost_today) / llm_daily_budget_usd * 100 if llm_daily_budget_usd else 0.0,
+        # The LLM budget is real money in either mode, so it is enforced (and shown) across both.
+        budget_used_pct=llm_spend_today_all_modes_usd / llm_daily_budget_usd * 100 if llm_daily_budget_usd else 0.0,
+        llm_spend_today_all_modes=llm_spend_today_all_modes_usd,
         avg_cost_per_call=llm_cost / calls if calls else None,
         projected_monthly_cost=projected,
         projection_basis_hours=basis_hours,
@@ -268,7 +278,7 @@ async def compute_activity(
         await session.exec(
             select(TradeRecord)
             .where(TradeRecord.is_paper == is_paper, col(TradeRecord.side).is_not(None))
-            .order_by(col(TradeRecord.entry_time).desc())
+            .order_by(col(TradeRecord.entry_time).desc(), col(TradeRecord.id).desc())
             .limit(limit)
         )
     ).all()
@@ -291,7 +301,10 @@ async def compute_activity(
 
     trace_rows = (
         await session.exec(
-            select(EvaluationTraceRecord).order_by(col(EvaluationTraceRecord.created_at).desc()).limit(limit)
+            select(EvaluationTraceRecord)
+            .where(_mode_filter(is_paper))
+            .order_by(col(EvaluationTraceRecord.created_at).desc(), col(EvaluationTraceRecord.id).desc())
+            .limit(limit)
         )
     ).all()
     decisions = [
