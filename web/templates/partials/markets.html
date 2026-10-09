@@ -1,0 +1,47 @@
+{% set m = markets_ctx %}
+<section id="markets-panel" class="panel wide"
+         hx-get="/partials/markets" hx-trigger="every 2s" hx-swap="outerHTML">
+  <h2>Active 15m options · model N(d₂) probabilities</h2>
+  {% if m.markets %}
+  <table>
+    <thead>
+      <tr>
+        <th>Ticker</th><th>Strike K</th><th>Spot − K</th><th>Time left</th>
+        <th>Yes bid / ask</th><th>Model N(d₂)</th><th>Fair</th><th>Gross edge</th>
+        <th>d₂</th><th>σ (ann.)</th><th>Mom. 1m</th><th>Signal</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for snap in m.markets %}
+      {% set st = snap.state %}{% set fv = snap.fair_value %}{% set q = snap.quote %}
+      <tr>
+        <td>{{ st.ticker }}</td>
+        <td>${{ "{:,.0f}".format(st.strike_price) }}</td>
+        <td>{{ "{:+,.0f}".format(st.current_spot_price - st.strike_price) }}</td>
+        <td>{{ st.seconds_remaining // 60 }}m {{ "%02d" | format(st.seconds_remaining % 60) }}s</td>
+        <td>{% if q %}{{ q.yes_bid }}¢ / {{ q.yes_ask }}¢{% else %}<span class="muted">—</span>{% endif %}</td>
+        {% if fv %}
+        <td>{{ "%.1f" | format(fv.model_probability * 100) }}%</td>
+        <td>{{ fv.fair_cents }}¢</td>
+        <td>{{ "{:+.1f}".format(fv.gross_edge * 100) }}%</td>
+        <td>{{ "%.2f" | format(fv.d2_score) }}</td>
+        <td>{{ "%.1f" | format(fv.volatility_used * 100) }}%</td>
+        {% else %}
+        <td colspan="5" class="muted">awaiting pricing</td>
+        {% endif %}
+        <td>{{ "{:+.3f}".format(st.momentum_1m) }}%</td>
+        <td>
+          {% if fv and fv.gross_edge >= m.params.min_gross_edge %}
+          <span class="pill good">▲ Edge ≥ {{ "%.1f" | format(m.params.min_gross_edge * 100) }}%</span>
+          {% else %}
+          <span class="muted">—</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">No active KXBTC15M markets yet. The live trader publishes them here.</div>
+  {% endif %}
+</section>

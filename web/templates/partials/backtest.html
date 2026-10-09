@@ -1,0 +1,76 @@
+{% set b = backtest_ctx %}
+<section id="backtest-panel" class="panel"
+         {% if b.status == "running" %}hx-get="/partials/backtest" hx-trigger="every 1s" hx-swap="outerHTML"{% endif %}>
+  <h2>Backtest performance</h2>
+  <div class="toolbar">
+    <button hx-post="/optimize" hx-target="#backtest-panel" hx-swap="outerHTML"
+            {% if b.status == "running" %}disabled{% endif %}>
+      {% if b.status == "running" %}Optimizing…{% else %}Optimize Parameters{% endif %}
+    </button>
+    {% if b.status == "running" %}
+      <span class="muted">Grid search running over edge, volatility lookback, and momentum weight…</span>
+    {% elif b.status == "error" %}
+      <span class="pill critical">✕ Optimizer failed</span> <span class="error">{{ b.error }}</span>
+    {% elif b.result %}
+      <span class="muted">{{ b.result.message }}</span>
+    {% endif %}
+  </div>
+
+  {% set p = b.active_params %}
+  <div class="muted" style="margin-bottom: 12px;">
+    Active parameters: min edge {{ "%.1f" | format(p.min_gross_edge * 100) }}% ·
+    vol lookback {{ p.volatility_lookback_sec }}s ·
+    momentum weight {{ "%.2f" | format(p.momentum_weight) }} ·
+    Kelly × {{ p.kelly_scaling }} · max {{ "%.0f" | format(p.max_trade_bankroll_pct * 100) }}% / trade
+  </div>
+
+  {% if b.result and b.result.best %}
+    {% set r = b.result.best %}
+    <div class="tiles">
+      <div class="tile"><div class="label">Sharpe (ann.)</div><div class="value">{{ "%.2f" | format(r.sharpe_ratio) }}</div></div>
+      <div class="tile"><div class="label">Win rate</div><div class="value">{{ "%.1f" | format(r.win_rate * 100) }}%</div></div>
+      <div class="tile"><div class="label">Net PnL</div>
+        <div class="value {{ 'delta-up' if r.total_net_pnl >= 0 else 'delta-down' }}">
+          {{ "▲" if r.total_net_pnl >= 0 else "▼" }} ${{ "{:,.2f}".format(r.total_net_pnl | abs) }}
+        </div>
+      </div>
+      <div class="tile"><div class="label">Trades</div><div class="value">{{ r.num_trades }}</div></div>
+      <div class="tile"><div class="label">Max drawdown</div><div class="value">{{ "%.1f" | format(r.max_drawdown_pct * 100) }}%</div></div>
+      <div class="tile"><div class="label">Fees paid</div><div class="value">${{ "{:,.2f}".format(r.total_fees) }}</div></div>
+    </div>
+    {{ b.chart | safe }}
+    <details>
+      <summary>Top {{ b.result.leaderboard | length }} parameter sets</summary>
+      <table>
+        <thead><tr><th>#</th><th>Min edge</th><th>Vol lookback</th><th>Momentum w</th><th>Trades</th><th>Win rate</th><th>Net PnL</th><th>Sharpe</th></tr></thead>
+        <tbody>
+          {% for row in b.result.leaderboard %}
+          <tr>
+            <td>{{ loop.index }}</td>
+            <td>{{ "%.1f" | format(row.params.min_gross_edge * 100) }}%</td>
+            <td>{{ row.params.volatility_lookback_sec }}s</td>
+            <td>{{ "%.2f" | format(row.params.momentum_weight) }}</td>
+            <td>{{ row.num_trades }}</td>
+            <td>{{ "%.1f" | format(row.win_rate * 100) }}%</td>
+            <td>{{ "{:+,.2f}".format(row.total_net_pnl) }}</td>
+            <td>{{ "%.2f" | format(row.sharpe_ratio) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </details>
+    <details>
+      <summary>Equity curve data table</summary>
+      <table>
+        <thead><tr><th>Time (UTC)</th><th>Equity</th></tr></thead>
+        <tbody>
+          {% for pt in r.equity_curve %}
+          <tr><td>{{ pt.timestamp.strftime("%Y-%m-%d %H:%M") }}</td><td>${{ "{:,.2f}".format(pt.equity) }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </details>
+  {% elif b.status != "running" %}
+    <div class="empty">No backtest yet. Click “Optimize Parameters” to replay settled trades.</div>
+  {% endif %}
+</section>

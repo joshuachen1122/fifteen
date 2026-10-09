@@ -1,4 +1,7 @@
-"""SQLModel persistence tables.
+"""SQLModel persistence tables shared by the live trader, backtester, optimizer, and dashboard.
+
+These are storage rows, not part of the `core/schemas.py` contract. Conversion
+helpers map them onto the contract types where one exists.
 
 All datetimes are stored as UTC. SQLite has no native timezone support, so
 `UTCDateTime` strips tzinfo on write and re-attaches UTC on read.
@@ -12,7 +15,7 @@ from typing import Any, Optional
 from sqlalchemy import JSON, Column, DateTime, TypeDecorator
 from sqlmodel import Field, SQLModel
 
-from core.schemas import StrategyParameters
+from core.schemas import BtcSpotTick, StrategyParameters
 
 
 def utc_now() -> datetime:
@@ -43,12 +46,17 @@ def _utc_field(*, default_now: bool = False, nullable: bool = False, index: bool
 
 
 class BtcPriceHistory(SQLModel, table=True):
+    """Historical BTC spot ticks used to replay volatility & momentum."""
+
     __tablename__ = "btc_price_history"
 
     id: Optional[int] = Field(default=None, primary_key=True)
     source: str = Field(index=True)
     price: float
     timestamp: datetime = _utc_field(index=True)
+
+    def to_tick(self) -> BtcSpotTick:
+        return BtcSpotTick(source=self.source, price=self.price, timestamp=self.timestamp)
 
 
 class EvaluationTraceRecord(SQLModel, table=True):
@@ -94,19 +102,34 @@ class EvaluationTraceRecord(SQLModel, table=True):
 
 
 class TradeRecord(SQLModel, table=True):
+    """A market opportunity the live trader observed or traded, plus its settlement.
+
+    The backtester re-decides each row under candidate parameters, so the row
+    stores the quote at observation time (not just what was actually traded).
+    """
+
     __tablename__ = "trades"
 
     id: Optional[int] = Field(default=None, primary_key=True)
     created_at: datetime = _utc_field(default_now=True, index=True)
     evaluation_id: Optional[int] = Field(default=None, foreign_key="evaluation_traces.id", index=True)
 
-    # OrderRequest
+    # Market snapshot at entry (replayed by the backtester)
     ticker: str = Field(index=True)
-    side: str  # "yes" | "no"
-    count: int
-    max_cost_cents: int
-    kelly_fraction: float
-    reasoning: str
+    strike_price: Optional[float] = None
+    entry_time: datetime = _utc_field(default_now=True, index=True)
+    expiration_time: Optional[datetime] = _utc_field(nullable=True)
+    yes_bid: Optional[int] = None  # Cents (1-99) at entry_time
+    yes_ask: Optional[int] = None  # Cents (1-99) at entry_time
+    model_probability: Optional[float] = None
+    volatility_used: Optional[float] = None
+
+    # OrderRequest; side is None for observed-but-untraded opportunities
+    side: Optional[str] = None  # "yes" | "no"
+    count: int = 0
+    max_cost_cents: int = 0
+    kelly_fraction: float = 0.0
+    reasoning: str = ""
 
     # Exchange lifecycle
     kalshi_order_id: Optional[str] = Field(default=None, index=True)
@@ -114,15 +137,17 @@ class TradeRecord(SQLModel, table=True):
     is_paper: bool = True
     filled_count: int = 0
     avg_fill_price_cents: Optional[float] = None
+    fees_cents: int = 0
 
     # Settlement
     settled_at: Optional[datetime] = _utc_field(nullable=True)
-    settlement_result: Optional[str] = None  # "yes" | "no"
-    pnl_cents: Optional[int] = None
+    settled_yes: Optional[bool] = None  # True if BTC settled above strike
+    settlement_price: Optional[float] = None
+    realized_pnl_cents: Optional[int] = None  # Net of fees
 
 
 class StrategyParametersRecord(SQLModel, table=True):
-    """Versioned snapshot of `StrategyParameters`, e.g. produced by the optimizer."""
+    """Versioned snapshot of `StrategyParameters`. The live trader reloads the row with is_active=True."""
 
     __tablename__ = "strategy_parameters"
 
@@ -137,8 +162,13 @@ class StrategyParametersRecord(SQLModel, table=True):
 
     is_active: bool = Field(default=False, index=True)
     source: str = "default"  # "default" | "optimizer" | "manual"
-    backtest_score: Optional[float] = None
     notes: Optional[str] = None
+
+    # Backtest metrics, populated when source == "optimizer"
+    sharpe_ratio: Optional[float] = None
+    win_rate: Optional[float] = None
+    total_net_pnl: Optional[float] = None  # Dollars
+    num_trades: Optional[int] = None
 
     @classmethod
     def from_schema(cls, params: StrategyParameters, **extra: Any) -> StrategyParametersRecord:
