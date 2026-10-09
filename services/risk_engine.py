@@ -57,6 +57,10 @@ class RiskEngine:
 
     Equity is cash plus open positions marked at cost, so the drawdown check reacts
     to fees and settled losses; open positions resolve within 15 minutes.
+
+    Optional hard caps bound real-money exposure regardless of what Kelly asks for: the
+    all-in cost (price + fee) of any one order, and the all-in cost of everything bought in
+    one UTC day.
     """
 
     def __init__(
@@ -64,6 +68,8 @@ class RiskEngine:
         starting_bankroll_cents: int,
         daily_drawdown_limit: float = DAILY_DRAWDOWN_LIMIT,
         now: Optional[datetime] = None,
+        max_order_cost_cents: Optional[int] = None,
+        daily_spend_limit_cents: Optional[int] = None,
     ) -> None:
         self.cash_cents = starting_bankroll_cents
         self.open_exposure_cents = 0
@@ -73,6 +79,15 @@ class RiskEngine:
         self._day: date = _utc_date(now)
         self._day_start_equity_cents = starting_bankroll_cents
         self._halted = False
+        self.max_order_cost_cents = max_order_cost_cents
+        self.daily_spend_limit_cents = daily_spend_limit_cents
+        self.spent_today_cents = 0
+
+    def remaining_daily_spend_cents(self, now: Optional[datetime] = None) -> Optional[int]:
+        self._roll_day(now)
+        if self.daily_spend_limit_cents is None:
+            return None
+        return max(self.daily_spend_limit_cents - self.spent_today_cents, 0)
 
     @property
     def equity_cents(self) -> int:
@@ -114,6 +129,11 @@ class RiskEngine:
 
         budget_cents = int(fraction * self.equity_cents)
         budget_cents = min(budget_cents, self.cash_cents)
+        if self.max_order_cost_cents is not None:
+            budget_cents = min(budget_cents, self.max_order_cost_cents)
+        remaining = self.remaining_daily_spend_cents(now)
+        if remaining is not None:
+            budget_cents = min(budget_cents, remaining)
         count = budget_cents // price_cents
         while count > 0 and count * price_cents + kalshi_taker_fee_cents(count, price_cents) > budget_cents:
             count -= 1
@@ -129,9 +149,16 @@ class RiskEngine:
             reasoning=reasoning,
         )
 
-    def open_position(self, order: OrderRequest, price_cents: int, now: Optional[datetime] = None) -> Position:
+    def open_position(
+        self,
+        order: OrderRequest,
+        price_cents: int,
+        now: Optional[datetime] = None,
+        fee_cents: Optional[int] = None,
+    ) -> Position:
+        """Book a fill. `fee_cents` is the exchange-reported fee when known (live fills)."""
         self._roll_day(now)
-        fee = kalshi_taker_fee_cents(order.count, price_cents)
+        fee = kalshi_taker_fee_cents(order.count, price_cents) if fee_cents is None else fee_cents
         position = Position(
             ticker=order.ticker,
             side=order.side,
@@ -144,6 +171,7 @@ class RiskEngine:
         self.open_exposure_cents += position.cost_cents
         self.fees_paid_cents += fee
         self.realized_pnl_cents -= fee
+        self.spent_today_cents += position.cost_cents + fee
         self._check_drawdown()
         return position
 
@@ -164,6 +192,7 @@ class RiskEngine:
             self._day = today
             self._day_start_equity_cents = self.equity_cents
             self._halted = False
+            self.spent_today_cents = 0
 
     def _check_drawdown(self) -> None:
         floor = self._day_start_equity_cents * (1 - self.daily_drawdown_limit)

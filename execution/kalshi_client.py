@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 import os
 import re
 import time
@@ -165,6 +166,9 @@ class OrderResult(BaseModel):
     price_cents: int
     filled_count: int = 0
     paper: bool = False
+    # Actual execution on our side of the book (NO price for NO buys), when the exchange reports it.
+    avg_fill_price_cents: float | None = None
+    fees_cents: int | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod
@@ -227,6 +231,7 @@ class KalshiClient:
         self._rate_limiter = rate_limiter or TokenBucketRateLimiter(DEFAULT_REQUESTS_PER_SECOND)
         self._owns_http = http_client is None
         self._http = http_client or httpx.AsyncClient(timeout=timeout)
+        self._paper_starting_balance_cents = paper_starting_balance_cents
         self._paper_balance_cents = paper_starting_balance_cents
         self._paper_orders: dict[str, OrderResult] = {}
 
@@ -323,12 +328,28 @@ class KalshiClient:
             )
         return body if isinstance(body, dict) else {"data": body}
 
-    async def get_balance(self) -> int:
-        """Available balance in cents."""
+    @property
+    def can_trade_live(self) -> bool:
+        return self._signer is not None
+
+    def reset_paper_balance(self) -> None:
+        self._paper_balance_cents = self._paper_starting_balance_cents
+
+    async def get_balance(self, exchange_index: int | None = None) -> int:
+        """Available balance in cents, optionally scoped to one exchange shard.
+
+        Kalshi shards collateral per exchange index, and API orders can only use the balance
+        already on the shard their market trades on."""
         if self.is_paper:
             return self._paper_balance_cents
-        body = await self._request("GET", "/portfolio/balance")
+        params = None if exchange_index is None else {"exchange_index": exchange_index}
+        body = await self._request("GET", "/portfolio/balance", params=params)
         return int(body["balance"])
+
+    async def get_series_exchange_index(self, series_ticker: str) -> int | None:
+        body = await self._request("GET", f"/series/{series_ticker}", auth=self._signer is not None)
+        index = (body.get("series") or {}).get("exchange_index")
+        return None if index is None else int(index)
 
     async def get_markets(
         self,
@@ -362,25 +383,74 @@ class KalshiClient:
         if self.is_paper:
             self._paper_balance_cents += cents
 
-    async def submit_order(self, order: OrderRequest, *, client_order_id: str | None = None) -> OrderResult:
-        """Submit a buy limit order priced at ``max_cost_cents // count`` per contract."""
+    async def submit_order(
+        self,
+        order: OrderRequest,
+        *,
+        client_order_id: str | None = None,
+        exchange_index: int | None = None,
+    ) -> OrderResult:
+        """Buy at most ``order.count`` contracts at a limit of ``max_cost_cents // count`` per contract.
+
+        Live orders are immediate-or-cancel: whatever does not fill at once is cancelled by the
+        exchange, so nothing is left resting on a 15-minute contract."""
         price = limit_price_cents(order)
         client_order_id = client_order_id or str(uuid.uuid4())
         if self.is_paper:
             return self._paper_submit(order, price, client_order_id)
 
+        # Order V2 quotes the YES leg only: buying NO at p is an ask on YES at 100 - p.
+        yes_price = price if order.side == "yes" else 100 - price
         payload: dict[str, Any] = {
             "ticker": order.ticker,
             "client_order_id": client_order_id,
-            "action": "buy",
-            "side": order.side,
-            "count": order.count,
-            "type": "limit",
-            f"{order.side}_price": price,
+            "side": "bid" if order.side == "yes" else "ask",
+            "count": f"{order.count}.00",
+            "price": f"{yes_price / 100:.4f}",
+            "time_in_force": "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
         }
+        if exchange_index is not None:
+            payload["exchange_index"] = exchange_index
         logger.info("submitting live order %s", payload)
-        body = await self._request("POST", "/portfolio/orders", json=payload)
-        return OrderResult.from_api(body["order"])
+        body = await self._request("POST", "/portfolio/events/orders", json=payload)
+        filled = round(float(body.get("fill_count") or 0))
+        result = OrderResult(
+            order_id=body["order_id"],
+            client_order_id=body.get("client_order_id", client_order_id),
+            ticker=order.ticker,
+            side=order.side,  # type: ignore[arg-type]  # validated by limit_price_cents
+            status="executed" if filled >= order.count else ("partial" if filled > 0 else "canceled"),
+            count=order.count,
+            price_cents=price,
+            filled_count=filled,
+            raw=body,
+        )
+        if filled > 0:
+            result = await self._with_fill_details(result)
+        return result
+
+    async def _with_fill_details(self, result: OrderResult) -> OrderResult:
+        """Price and fee from the fills ledger, which states YES and NO prices explicitly."""
+        try:
+            body = await self._request("GET", "/portfolio/fills", params={"order_id": result.order_id})
+        except KalshiAPIError as exc:
+            logger.warning("could not load fills for %s: %s", result.order_id, exc)
+            return result
+        fills = [f for f in body.get("fills", []) if f.get("order_id") == result.order_id]
+        count = sum(float(f.get("count_fp") or f.get("count") or 0) for f in fills)
+        if count <= 0:
+            return result
+        price_key = f"{result.side}_price_dollars"
+        notional = sum(float(f.get("count_fp") or f.get("count") or 0) * float(f[price_key]) for f in fills)
+        fees = sum(float(f.get("fee_cost") or 0) for f in fills)
+        return result.model_copy(
+            update={
+                "avg_fill_price_cents": notional / count * 100,
+                "fees_cents": math.ceil(fees * 100 - 1e-9),
+                "raw": {**result.raw, "fills": fills},
+            }
+        )
 
     async def cancel_order(self, order_id: str) -> OrderResult:
         if self.is_paper:

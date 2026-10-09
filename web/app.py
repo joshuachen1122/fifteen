@@ -5,15 +5,19 @@ The live trader pushes data in through `DashboardState.update_spot` / `update_ma
 """
 
 import asyncio
+import base64
+import binascii
 import logging
+import secrets
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional, Protocol
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -28,6 +32,27 @@ logger = logging.getLogger(__name__)
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 SPOT_HISTORY_LEN = 900
+
+
+class TradingControls(Protocol):
+    """Operator actions exposed on the dashboard (implemented by the live TradingAgent)."""
+
+    def controls_state(self) -> dict[str, Any]: ...
+    async def switch_mode(self, live: bool) -> None: ...
+    async def set_limits(self, max_trade_usd: float, max_daily_trade_usd: float) -> None: ...
+
+
+UNAUTHENTICATED_PATHS = {"/healthz"}  # Fly health checks
+
+
+def _password_ok(header: Optional[str], password: str) -> bool:
+    if not header or not header.lower().startswith("basic "):
+        return False
+    try:
+        _, _, supplied = base64.b64decode(header[6:]).decode().partition(":")
+    except (binascii.Error, UnicodeDecodeError):
+        return False
+    return secrets.compare_digest(supplied.encode(), password.encode())
 
 
 class MarketSnapshot(BaseModel):
@@ -84,6 +109,8 @@ def create_app(
     state: Optional[DashboardState] = None,
     engine: Optional[AsyncEngine] = None,
     optimizer_factory: Optional[Callable[[AsyncEngine], Optimizer]] = None,
+    controls: Optional[TradingControls] = None,
+    password: Optional[str] = None,
 ) -> FastAPI:
     state = state or DashboardState()
     engine = engine or make_engine()
@@ -99,6 +126,18 @@ def create_app(
     app = FastAPI(title="BTC 15m Kalshi Agent", lifespan=lifespan)
     app.state.dashboard = state
     app.state.engine = engine
+
+    if password:
+
+        @app.middleware("http")
+        async def require_password(request: Request, call_next: Any) -> Response:
+            if request.url.path in UNAUTHENTICATED_PATHS or _password_ok(
+                request.headers.get("authorization"), password
+            ):
+                return await call_next(request)
+            return Response(
+                "Authentication required", status_code=401, headers={"WWW-Authenticate": 'Basic realm="btc15m"'}
+            )
 
     async def run_optimizer() -> None:
         try:
@@ -164,8 +203,48 @@ def create_app(
             "backtest_ctx": await backtest_context(),
             "stats": state.stats,
             "activity": state.activity,
+            "controls_ctx": controls_context(),
         }
         return TEMPLATES.TemplateResponse(request, "index.html", context)
+
+    def controls_context(error: Optional[str] = None, notice: Optional[str] = None) -> dict[str, Any]:
+        if controls is None:
+            return {"available": False}
+        return {"available": True, "editable": bool(password), "error": error, "notice": notice, **controls.controls_state()}
+
+    def controls_response(request: Request, **kwargs: Any) -> HTMLResponse:
+        return TEMPLATES.TemplateResponse(request, "partials/controls.html", {"controls_ctx": controls_context(**kwargs)})
+
+    async def form(request: Request) -> dict[str, str]:
+        return {k: v[0] for k, v in parse_qs((await request.body()).decode()).items()}
+
+    @app.get("/partials/controls", response_class=HTMLResponse)
+    async def controls_partial(request: Request) -> HTMLResponse:
+        return controls_response(request)
+
+    @app.post("/controls/mode", response_class=HTMLResponse)
+    async def set_mode(request: Request) -> HTMLResponse:
+        if controls is None or not password:
+            return controls_response(request, error="Set DASHBOARD_PASSWORD to enable dashboard controls.")
+        mode = (await form(request)).get("mode")
+        if mode not in ("paper", "live"):
+            return controls_response(request, error=f"Unknown mode {mode!r}.")
+        try:
+            await controls.switch_mode(mode == "live")
+        except ValueError as exc:
+            return controls_response(request, error=str(exc))
+        return controls_response(request, notice=f"Switched to {mode.upper()} trading.")
+
+    @app.post("/controls/limits", response_class=HTMLResponse)
+    async def set_limits(request: Request) -> HTMLResponse:
+        if controls is None or not password:
+            return controls_response(request, error="Set DASHBOARD_PASSWORD to enable dashboard controls.")
+        data = await form(request)
+        try:
+            await controls.set_limits(float(data["max_trade_usd"]), float(data["max_daily_trade_usd"]))
+        except (KeyError, ValueError) as exc:
+            return controls_response(request, error=f"Invalid limits: {exc}")
+        return controls_response(request, notice="Spend caps updated.")
 
     @app.get("/partials/activity", response_class=HTMLResponse)
     async def activity_partial(request: Request) -> HTMLResponse:

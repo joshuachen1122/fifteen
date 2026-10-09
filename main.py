@@ -37,7 +37,7 @@ from core.constants import DEFAULT_DATABASE_URL, SPOT_SOURCE_COINBASE
 from core.schemas import Btc15mMarketState, BtcSpotTick, FairValueOutput, LLMVerdict, MarketQuote, OrderRequest, StrategyParameters
 from core.state_manager import BtcStateManager
 from db.database import Database
-from db.models import BtcPriceHistory, EvaluationTraceRecord, TradeRecord
+from db.models import BtcPriceHistory, EvaluationTraceRecord, RuntimeSetting, TradeRecord, utc_now
 from execution.kalshi_client import KalshiAPIError, KalshiClient, OrderResult
 from execution.order_scanner import KalshiOrderBookScanner, ScanCandidate, SpotContext
 from pricing.btc_digital_option import price_digital_option
@@ -73,6 +73,12 @@ class Settings(BaseSettings):
     llm_min_seconds_remaining: int = 60  # too little time left to act on a verdict
     max_plausible_edge: float = 0.30  # larger "edges" are almost always bad quotes, not mispricing
     llm_daily_budget_usd: float = 5.0  # hard cap; past it the agent fails closed (no LLM, no trades)
+
+    # Real-money controls. These are defaults: changes made on the dashboard are persisted and win.
+    max_trade_usd: float = 1.00  # all-in cost (price + fee) of any single order
+    max_daily_trade_usd: float = 100.00  # all-in cost of everything bought per UTC day
+    allow_live_trading: bool = False  # server-side guard; the dashboard cannot enable live without it
+    dashboard_password: Optional[str] = None  # HTTP basic auth; required before live trading is allowed
 
     # Settlement & auto-tuning
     settlement_poll_sec: float = 180.0
@@ -134,6 +140,9 @@ class TradingAgent:
         self._llm_spend_today_usd = 0.0
         self.llm_screened: Counter[str] = Counter()  # candidates rejected before a paid call, by reason
         self._initial_bankroll_cents = 0
+        self.max_trade_cents = round(settings.max_trade_usd * 100)
+        self.max_daily_cents = round(settings.max_daily_trade_usd * 100)
+        self.exchange_index: Optional[int] = None  # Kalshi shard the series trades on (live only)
         self._inflight: set[str] = set()
         self._handlers: set[asyncio.Task[None]] = set()
         self._order_lock = asyncio.Lock()  # sizing must see the bankroll left by the previous fill
@@ -158,7 +167,16 @@ class TradingAgent:
         """Rebuild bankroll, open positions, and active parameters after a (re)start."""
         await self.reload_parameters()
         now = self._clock()
-        balance = await self.client.get_balance()
+        self._positions.clear()
+        self._trade_rows.clear()
+        if self.client.is_paper:
+            self.client.reset_paper_balance()
+            balance = await self.client.get_balance()
+        else:
+            # API orders can only use collateral already on the series' exchange shard.
+            if self.exchange_index is None:
+                self.exchange_index = await self.client.get_series_exchange_index(self.scanner.series_ticker)
+            balance = await self.client.get_balance(exchange_index=self.exchange_index)
 
         async with self.db.session() as session:
             open_rows = (
@@ -191,7 +209,12 @@ class TradingAgent:
         # them; a live Kalshi balance already reflects settlements but excludes open positions.
         starting = balance + settled_pnl if self.client.is_paper else balance + open_cost
         self._initial_bankroll_cents = starting - settled_pnl
-        self.risk = RiskEngine(starting, now=now)
+        self.risk = RiskEngine(
+            starting,
+            now=now,
+            max_order_cost_cents=self.max_trade_cents,
+            daily_spend_limit_cents=self.max_daily_cents,
+        )
         for row in open_rows:
             assert row.id is not None and row.side is not None
             order = OrderRequest(
@@ -205,15 +228,109 @@ class TradingAgent:
             self._positions[row.id] = self.risk.open_position(order, _fill_price(row), now=now)
         if self.client.is_paper:
             self.client.credit_paper_balance(self.risk.cash_cents - balance)
+        self.risk.spent_today_cents = await self._spent_today_cents(now)
         self._trade_rows = {r.ticker: r.id for r in active_rows if r.id is not None}
         await self._load_llm_spend(now)
 
         logger.info(
-            "restored %s bankroll: equity $%.2f, %d open position(s)",
-            "PAPER" if self.client.is_paper else "LIVE",
+            "restored %s bankroll: equity $%.2f, %d open position(s), spent today $%.2f of $%.2f",
+            "PAPER" if self.client.is_paper else f"LIVE (exchange {self.exchange_index})",
             self.risk.equity_cents / 100,
             len(self._positions),
+            self.risk.spent_today_cents / 100,
+            self.max_daily_cents / 100,
         )
+
+    async def _spent_today_cents(self, now: datetime) -> int:
+        midnight = datetime.combine(now.date(), time.min, tzinfo=timezone.utc)
+        async with self.db.session() as session:
+            rows = (
+                await session.exec(
+                    select(TradeRecord).where(
+                        TradeRecord.is_paper == self.client.is_paper,
+                        TradeRecord.filled_count > 0,
+                        TradeRecord.entry_time >= midnight,
+                    )
+                )
+            ).all()
+        return sum(_fill_price(r) * r.filled_count + r.fees_cents for r in rows)
+
+    # -- operator controls (dashboard) ------------------------------------------
+
+    @property
+    def is_live(self) -> bool:
+        return not self.client.is_paper
+
+    def live_blocked_reason(self) -> Optional[str]:
+        if not self.settings.allow_live_trading:
+            return "ALLOW_LIVE_TRADING is not enabled on the server"
+        if not self.client.can_trade_live:
+            return "Kalshi API credentials are not configured"
+        if not self.settings.dashboard_password:
+            return "set DASHBOARD_PASSWORD so the dashboard is locked before trading real money"
+        return None
+
+    async def load_controls(self) -> None:
+        """Apply persisted dashboard overrides over the env defaults. Call before `restore()`."""
+        async with self.db.session() as session:
+            saved = {r.key: r.value for r in (await session.exec(select(RuntimeSetting))).all()}
+        if "max_trade_usd" in saved:
+            self.max_trade_cents = round(float(saved["max_trade_usd"]) * 100)
+        if "max_daily_trade_usd" in saved:
+            self.max_daily_cents = round(float(saved["max_daily_trade_usd"]) * 100)
+        mode = saved.get("trading_mode")
+        live = self.client.trading_enabled if mode is None else mode == "live"
+        if live and (reason := self.live_blocked_reason()):
+            logger.error("live trading requested but blocked (%s); staying in PAPER mode", reason)
+            live = False
+        self.client.trading_enabled = live
+
+    async def _save_setting(self, key: str, value: str) -> None:
+        async with self.db.session() as session:
+            row = await session.get(RuntimeSetting, key)
+            row = row or RuntimeSetting(key=key, value=value)
+            row.value, row.updated_at = value, utc_now()
+            session.add(row)
+            await session.commit()
+
+    async def switch_mode(self, live: bool) -> None:
+        """Toggle paper/live without a restart. Open positions in the old mode still settle."""
+        if live and (reason := self.live_blocked_reason()):
+            raise ValueError(f"cannot enable live trading: {reason}")
+        async with self._order_lock:  # never switch while an order is being sized or sent
+            if live == self.is_live:
+                return
+            self.client.trading_enabled = live
+            await self._save_setting("trading_mode", "live" if live else "paper")
+            await self.restore()
+        logger.warning("switched to %s trading", "*** LIVE ***" if live else "PAPER")
+
+    async def set_limits(self, max_trade_usd: float, max_daily_trade_usd: float) -> None:
+        if not (0 < max_trade_usd <= max_daily_trade_usd):
+            raise ValueError("limits must satisfy 0 < max per trade <= max per day")
+        async with self._order_lock:
+            self.max_trade_cents = round(max_trade_usd * 100)
+            self.max_daily_cents = round(max_daily_trade_usd * 100)
+            await self._save_setting("max_trade_usd", f"{max_trade_usd:.2f}")
+            await self._save_setting("max_daily_trade_usd", f"{max_daily_trade_usd:.2f}")
+            if self.risk is not None:
+                self.risk.max_order_cost_cents = self.max_trade_cents
+                self.risk.daily_spend_limit_cents = self.max_daily_cents
+        logger.warning("spend caps set: $%.2f per trade, $%.2f per day", max_trade_usd, max_daily_trade_usd)
+
+    def controls_state(self) -> dict[str, Any]:
+        now = self._clock()
+        remaining = self.risk.remaining_daily_spend_cents(now) if self.risk else None
+        return {
+            "mode": "live" if self.is_live else "paper",
+            "live_blocked_reason": self.live_blocked_reason(),
+            "max_trade_usd": self.max_trade_cents / 100,
+            "max_daily_trade_usd": self.max_daily_cents / 100,
+            "spent_today_usd": (self.risk.spent_today_cents / 100) if self.risk else 0.0,
+            "remaining_today_usd": None if remaining is None else remaining / 100,
+            "cash_usd": (self.risk.cash_cents / 100) if self.risk else None,
+            "exchange_index": self.exchange_index,
+        }
 
     async def reload_parameters(self) -> None:
         """Adopt the optimizer's active parameters (published by us or the dashboard)."""
@@ -512,35 +629,38 @@ class TradingAgent:
         assert self.risk is not None
         # RiskEngine's max_cost_cents includes the taker fee, but Kalshi bills fees separately and
         # KalshiClient derives the limit price as max_cost_cents // count. Limit at the ask itself.
+        # Live orders are immediate-or-cancel, so an unfilled remainder never rests on the book.
         try:
-            result = await self.client.submit_order(order.model_copy(update={"max_cost_cents": order.count * ask}))
+            result = await self.client.submit_order(
+                order.model_copy(update={"max_cost_cents": order.count * ask}),
+                exchange_index=None if self.client.is_paper else self.exchange_index,
+            )
         except KalshiAPIError as exc:
             logger.error("order rejected for %s %s: %s", order.ticker, order.side, exc)
             return None, None
-
-        if result.filled_count < result.count and result.status == "resting":
-            # Take what crossed immediately; do not leave stale resting orders on a 15m contract.
-            with contextlib.suppress(KalshiAPIError):
-                await self.client.cancel_order(result.order_id)
         if result.filled_count <= 0:
+            logger.info("%s %s order for %s did not fill at %dc", "PAPER" if result.paper else "LIVE", order.side, order.ticker, ask)
             return result, None
 
+        # Book what actually executed: live fills can be cheaper than the limit, and Kalshi
+        # reports the fee it charged.
+        price = ask if result.avg_fill_price_cents is None else round(result.avg_fill_price_cents)
+        fee = result.fees_cents if result.fees_cents is not None else kalshi_taker_fee_cents(result.filled_count, price)
         filled = order.model_copy(
-            update={
-                "count": result.filled_count,
-                "max_cost_cents": result.filled_count * ask + kalshi_taker_fee_cents(result.filled_count, ask),
-            }
+            update={"count": result.filled_count, "max_cost_cents": result.filled_count * price + fee}
         )
-        position = self.risk.open_position(filled, ask, now=now)
+        position = self.risk.open_position(filled, price, now=now, fee_cents=fee)
         logger.info(
-            "%s %s %dx %s @ %dc (fee %dc, kelly %.4f)",
+            "%s %s %dx %s @ %dc (fee %dc, kelly %.4f, spent today $%.2f of $%.2f)",
             "PAPER" if result.paper else "LIVE",
             order.side.upper(),
             position.count,
             order.ticker,
-            ask,
+            price,
             position.fee_cents,
             order.kelly_fraction,
+            self.risk.spent_today_cents / 100,
+            self.max_daily_cents / 100,
         )
         return result, position
 
@@ -629,7 +749,9 @@ class TradingAgent:
                 row.kalshi_order_id = result.order_id
                 row.is_paper = result.paper
                 row.filled_count = position.count if position else 0
-                row.avg_fill_price_cents = float(ask) if position and ask is not None else None
+                row.avg_fill_price_cents = (
+                    (result.avg_fill_price_cents or float(position.price_cents)) if position else None
+                )
                 row.fees_cents = position.fee_cents if position else 0
                 row.status = _order_status(order.count, row.filled_count)
             session.add(row)
@@ -701,6 +823,18 @@ class TradingAgent:
                         self.client.credit_paper_balance(position.count * 100 if won else 0)
                         settled_positions += 1
                         logger.info("settled %s %s: net PnL %+dc", ticker, position.side, row.realized_pnl_cents)
+                    elif row.side is not None and row.filled_count > 0:
+                        # Opened before a paper/live switch: not on this RiskEngine's books, but its
+                        # PnL still belongs in the record (Kalshi pays out live positions itself).
+                        won = settled_yes == (row.side == "yes")
+                        cost = round((row.avg_fill_price_cents or 0) * row.filled_count)
+                        row.realized_pnl_cents = (row.filled_count * 100 if won else 0) - cost - row.fees_cents
+                        row.status = "settled"
+                        settled_positions += 1
+                        logger.info(
+                            "settled %s %s %s position: net PnL %+dc",
+                            ticker, "paper" if row.is_paper else "live", row.side, row.realized_pnl_cents,
+                        )
                     session.add(row)
                 await session.commit()
             self._trade_rows.pop(ticker, None)
@@ -791,6 +925,7 @@ async def run(settings: Settings) -> None:
     if not client.ws_auth_headers():
         logger.error("Kalshi credentials are not set: the order-book WebSocket requires them, even for paper trading")
     agent = TradingAgent(settings, db=db, client=client, feed=feed, evaluator=evaluator)
+    await agent.load_controls()
     await agent.restore()
     logger.warning(
         "starting in %s mode against %s", "PAPER" if client.is_paper else "*** LIVE TRADING ***", client.base_url
@@ -804,7 +939,13 @@ async def run(settings: Settings) -> None:
     tasks = agent.tasks()
     server: Optional[_Server] = None
     if settings.web_enabled:
-        app = create_app(agent.dashboard, db.engine, optimizer_factory=agent.make_optimizer)
+        app = create_app(
+            agent.dashboard,
+            db.engine,
+            optimizer_factory=agent.make_optimizer,
+            controls=agent,
+            password=settings.dashboard_password,
+        )
 
         @app.get("/healthz")
         async def healthz() -> dict[str, Any]:
@@ -814,6 +955,9 @@ async def run(settings: Settings) -> None:
                 "active_markets": len(agent.scanner.markets),
                 "equity_cents": agent.risk.equity_cents if agent.risk else None,
                 "halted": agent.risk.is_trading_halted() if agent.risk else None,
+                "max_trade_usd": agent.max_trade_cents / 100,
+                "max_daily_trade_usd": agent.max_daily_cents / 100,
+                "spent_today_usd": agent.risk.spent_today_cents / 100 if agent.risk else None,
             }
 
         server = _Server(uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning"))

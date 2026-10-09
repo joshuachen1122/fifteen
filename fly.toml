@@ -16,7 +16,11 @@ kill_timeout = "30s"
   PORT = "8080"
   LOG_LEVEL = "INFO"
   KALSHI_ENV = "prod"         # production market data; the Kalshi key is a production key
-  TRADING_ENABLED = "false"  # paper fills only; flip to "true" for real-money orders
+  TRADING_ENABLED = "false"     # boot default only; the dashboard toggle (persisted in agent.db) wins
+  ALLOW_LIVE_TRADING = "true"   # server-side guard: set "false" to force paper regardless of the dashboard
+  MAX_TRADE_USD = "1.00"        # default cap per order, price + fee (editable on the dashboard)
+  MAX_DAILY_TRADE_USD = "100.00"  # default cap per UTC day (editable on the dashboard)
+  # DASHBOARD_PASSWORD is a secret: fly secrets set DASHBOARD_PASSWORD=...
 
 # SQLite lives on the volume, so run exactly one machine and never auto-stop it.
 [mounts]

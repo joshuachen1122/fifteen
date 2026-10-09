@@ -186,3 +186,13 @@ class StrategyParametersRecord(SQLModel, table=True):
 
     def to_schema(self) -> StrategyParameters:
         return StrategyParameters(**self.model_dump(include=set(StrategyParameters.model_fields)))
+
+
+class RuntimeSetting(SQLModel, table=True):
+    """Operator overrides set from the dashboard (trading mode, spend caps); env vars are the defaults."""
+
+    __tablename__ = "runtime_settings"
+
+    key: str = Field(primary_key=True)
+    value: str
+    updated_at: datetime = _utc_field(default_now=True)

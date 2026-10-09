@@ -457,3 +457,39 @@ def test_unknown_fallback_model_is_priced_conservatively():
     known = LLMUsage(model="claude-sonnet-5-5", input_tokens=1000, output_tokens=100)
     unknown = LLMUsage(model="some-fallback-model", input_tokens=1000, output_tokens=100)
     assert unknown.cost_usd > known.cost_usd
+
+
+# ---------------------------------------------------------------- spend caps
+
+
+def test_order_cost_cap_bounds_price_plus_fee():
+    risk = RiskEngine(1_000_000, now=T0, max_order_cost_cents=100)
+    order = risk.size_order(fair_value(0.70, ask_cents=47), "yes", 47, StrategyParameters(), now=T0)
+    assert order is not None
+    # 2 contracts @ 47c + 4c fee = 98c fits; 3 would cost 141c + fee.
+    assert order.count == 2 and order.max_cost_cents == 98 <= 100
+
+
+def test_daily_spend_cap_is_cumulative_and_resets_next_day():
+    risk = RiskEngine(1_000_000, now=T0, max_order_cost_cents=100, daily_spend_limit_cents=150)
+    params = StrategyParameters()
+    first = risk.size_order(fair_value(0.70, ask_cents=47), "yes", 47, params, now=T0)
+    assert first is not None
+    risk.open_position(first, 47, now=T0)
+    assert risk.spent_today_cents == 98 and risk.remaining_daily_spend_cents(T0) == 52
+
+    second = risk.size_order(fair_value(0.70, ask_cents=47), "yes", 47, params, now=T0)
+    assert second is not None and second.count == 1 and second.max_cost_cents <= 52
+    risk.open_position(second, 47, now=T0)
+    assert risk.size_order(fair_value(0.70, ask_cents=47), "yes", 47, params, now=T0) is None  # 3c left
+
+    tomorrow = T0 + timedelta(days=1)
+    assert risk.remaining_daily_spend_cents(tomorrow) == 150
+    assert risk.size_order(fair_value(0.70, ask_cents=47), "yes", 47, params, now=tomorrow) is not None
+
+
+def test_open_position_uses_exchange_reported_fee():
+    risk = RiskEngine(10_000, now=T0)
+    order = OrderRequest(ticker="KXBTC15M-T", side="no", count=2, max_cost_cents=90, kelly_fraction=0.01, reasoning="")
+    position = risk.open_position(order, 43, now=T0, fee_cents=1)
+    assert position.fee_cents == 1 and risk.cash_cents == 10_000 - 86 - 1 and risk.spent_today_cents == 87

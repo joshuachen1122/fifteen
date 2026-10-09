@@ -129,7 +129,7 @@ async def test_candidate_flows_through_llm_and_fee_aware_kelly_to_paper_fill(db:
 
     await agent.handle_candidate(candidate)
 
-    expected = RiskEngine(100_000, now=T0).size_order(
+    expected = RiskEngine(100_000, now=T0, max_order_cost_cents=100, daily_spend_limit_cents=10_000).size_order(
         candidate.fair_value, "yes", YES_ASK, agent.params, probability_override=candidate.fair_value.model_probability
     )
     assert expected is not None and expected.count > 0
@@ -500,3 +500,215 @@ async def test_stats_count_multiple_llm_approvals(db: Database) -> None:
     assert stats.approval_rate_pct == pytest.approx(75.0)
     traded = sum(1 for d in (agent.dashboard.activity.decisions if agent.dashboard.activity else []) if d.decision == "trade")
     assert stats.bet_per_call_pct == pytest.approx(traded / 4 * 100)
+
+
+# ---------------------------------------------------------------- real-money controls
+
+from cryptography.hazmat.primitives.asymmetric import rsa as _rsa  # noqa: E402
+
+from execution.kalshi_client import KalshiRequestSigner, OrderResult  # noqa: E402
+from services.risk_engine import kalshi_taker_fee_cents as _fee  # noqa: E402
+
+
+class FakeLiveClient(SettlingClient):
+    """Credentialed client whose live endpoints are served from memory."""
+
+    def __init__(self, shard_balance_cents: int = 2829, fill_price: float | None = None, fee: int | None = None) -> None:
+        key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        super().__init__(signer=KalshiRequestSigner("kid", key))
+        self.shard_balance_cents = shard_balance_cents
+        self.fill_price, self.fee = fill_price, fee
+        self.live_orders: list[tuple[Any, int | None]] = []
+
+    async def get_series_exchange_index(self, series_ticker: str) -> int | None:
+        return 2
+
+    async def get_balance(self, exchange_index: int | None = None) -> int:
+        if self.is_paper:
+            return await super().get_balance()
+        assert exchange_index == 2, "live sizing must use the series' exchange shard"
+        return self.shard_balance_cents
+
+    async def submit_order(self, order: Any, *, client_order_id: str | None = None, exchange_index: int | None = None) -> OrderResult:
+        if self.is_paper:
+            return await super().submit_order(order, client_order_id=client_order_id)
+        self.live_orders.append((order, exchange_index))
+        price = order.max_cost_cents // order.count
+        return OrderResult(
+            order_id="live-1", ticker=order.ticker, side=order.side, status="executed", count=order.count,
+            price_cents=price, filled_count=order.count,
+            avg_fill_price_cents=self.fill_price if self.fill_price is not None else float(price),
+            fees_cents=self.fee if self.fee is not None else _fee(order.count, price),
+        )
+
+
+def make_live_agent(db: Database, clock: Clock, client: FakeLiveClient, **settings: Any) -> TradingAgent:
+    defaults = {"allow_live_trading": True, "dashboard_password": "pw"}
+    agent = make_agent(db, clock, FakeEvaluator(), **{**defaults, **settings})
+    client.results = agent.client.results  # type: ignore[attr-defined]
+    agent.client = client
+    agent.scanner._client = client
+    return agent
+
+
+async def test_every_paper_trade_respects_the_per_trade_cap(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.restore()
+    await agent.handle_candidate(yes_candidate(agent))
+    [row] = await trade_rows(db)
+    assert row.filled_count >= 1
+    assert row.filled_count * YES_ASK + row.fees_cents <= 100
+
+
+async def test_daily_cap_blocks_trades_once_spent(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator(), max_daily_trade_usd=1.00)
+    await agent.restore()
+    await agent.handle_candidate(yes_candidate(agent))
+    other = yes_candidate(agent).model_copy(update={"ticker": "KXBTC15M-26OCT091430-B82500"})
+    await agent.handle_candidate(other)
+    traded = [r for r in await trade_rows(db) if r.side]
+    assert len(traded) == 1
+    assert agent.risk is not None and agent.risk.remaining_daily_spend_cents(clock.now) < YES_ASK
+
+    restarted = make_agent(db, clock, FakeEvaluator(), max_daily_trade_usd=1.00)
+    await restarted.restore()  # today's spend survives a restart
+    assert restarted.risk is not None and restarted.risk.spent_today_cents == agent.risk.spent_today_cents
+
+
+@pytest.mark.parametrize(
+    ("settings", "with_signer", "reason"),
+    [
+        ({"allow_live_trading": False, "dashboard_password": "pw"}, True, "ALLOW_LIVE_TRADING"),
+        ({"allow_live_trading": True, "dashboard_password": None}, True, "DASHBOARD_PASSWORD"),
+        ({"allow_live_trading": True, "dashboard_password": "pw"}, False, "credentials"),
+    ],
+)
+async def test_live_mode_is_blocked_without_every_safeguard(db: Database, settings, with_signer, reason) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator(), **settings)
+    if with_signer:
+        live = FakeLiveClient()
+        agent.client = live
+    await agent.restore()
+    with pytest.raises(ValueError, match=reason):
+        await agent.switch_mode(True)
+    assert agent.client.is_paper
+
+
+async def test_switch_to_live_sizes_from_the_exchange_shard_and_books_actual_fills(db: Database) -> None:
+    clock = Clock(T0)
+    live = FakeLiveClient(shard_balance_cents=2829, fill_price=79.4, fee=1)
+    agent = make_live_agent(db, clock, live)
+    await agent.load_controls()
+    await agent.restore()
+    assert agent.client.is_paper
+
+    await agent.switch_mode(True)
+    assert agent.is_live and agent.exchange_index == 2
+    assert agent.risk is not None and agent.risk.equity_cents == 2829
+
+    await agent.handle_candidate(yes_candidate(agent))
+    [(order, exchange_index)] = live.live_orders
+    assert exchange_index == 2 and order.max_cost_cents == order.count * YES_ASK  # limit at the ask
+    [row] = [r for r in await trade_rows(db) if r.side]
+    assert (row.is_paper, row.avg_fill_price_cents, row.fees_cents) == (False, 79.4, 1)
+    assert agent.risk.cash_cents == 2829 - row.filled_count * 79 - 1
+
+    # The mode persists across restarts.
+    again = make_live_agent(db, clock, FakeLiveClient())
+    await again.load_controls()
+    assert again.is_live
+
+
+async def test_live_restart_is_refused_if_the_server_guard_is_removed(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_live_agent(db, clock, FakeLiveClient())
+    await agent.load_controls()
+    await agent.restore()
+    await agent.switch_mode(True)
+
+    guarded = make_live_agent(db, clock, FakeLiveClient(), allow_live_trading=False)
+    await guarded.load_controls()
+    assert guarded.client.is_paper
+
+
+async def test_positions_opened_before_a_mode_switch_still_settle_with_pnl(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_live_agent(db, clock, FakeLiveClient())
+    await agent.load_controls()
+    await agent.restore()
+    await agent.handle_candidate(yes_candidate(agent))  # paper fill
+    [paper_row] = [r for r in await trade_rows(db) if r.side]
+    await agent.switch_mode(True)
+    assert not agent._positions  # the live book starts empty
+
+    clock.now = T0 + timedelta(minutes=11)
+    agent.client.results[TICKER] = KalshiMarket(ticker=TICKER, strike_price=STRIKE, close_time=T0, result="yes")  # type: ignore[attr-defined]
+    assert await agent.settle_completed() == 1
+    [settled] = [r for r in await trade_rows(db) if r.side]
+    expected = paper_row.filled_count * (100 - YES_ASK) - paper_row.fees_cents
+    assert (settled.status, settled.realized_pnl_cents, settled.is_paper) == ("settled", expected, True)
+
+
+async def test_limits_can_be_changed_at_runtime_and_persist(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.restore()
+    await agent.set_limits(2.50, 40.00)
+    assert agent.risk is not None and (agent.risk.max_order_cost_cents, agent.risk.daily_spend_limit_cents) == (250, 4000)
+    with pytest.raises(ValueError):
+        await agent.set_limits(5.00, 1.00)
+
+    restarted = make_agent(db, clock, FakeEvaluator())
+    await restarted.load_controls()
+    assert (restarted.max_trade_cents, restarted.max_daily_cents) == (250, 4000)
+
+
+async def test_dashboard_is_password_protected_and_drives_the_controls(db: Database) -> None:
+    import httpx
+
+    from web.app import create_app
+
+    clock = Clock(T0)
+    agent = make_live_agent(db, clock, FakeLiveClient())
+    await agent.load_controls()
+    await agent.restore()
+    app = create_app(agent.dashboard, db.engine, controls=agent, password="s3cret")
+    app.get("/healthz")(lambda: {"ok": True})
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as anon:
+        assert (await anon.get("/")).status_code == 401
+        assert (await anon.post("/controls/mode", data={"mode": "live"})).status_code == 401
+        assert (await anon.get("/healthz")).status_code == 200
+    assert agent.client.is_paper
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://t", auth=("me", "wrong")) as bad:
+        assert (await bad.get("/")).status_code == 401
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://t", auth=("me", "s3cret")) as http:
+        page = await http.get("/")
+        assert page.status_code == 200 and "Trading controls" in page.text and "Switch to LIVE" in page.text
+        switched = await http.post("/controls/mode", data={"mode": "live"})
+        assert "Switched to LIVE trading" in switched.text and agent.is_live
+        caps = await http.post("/controls/limits", data={"max_trade_usd": "0.75", "max_daily_trade_usd": "20"})
+        assert "Spend caps updated" in caps.text and agent.max_trade_cents == 75
+        bad_caps = await http.post("/controls/limits", data={"max_trade_usd": "9", "max_daily_trade_usd": "1"})
+        assert "Invalid limits" in bad_caps.text and agent.max_trade_cents == 75
+        back = await http.post("/controls/mode", data={"mode": "paper"})
+        assert "Switched to PAPER" in back.text and agent.client.is_paper
+
+
+async def test_controls_are_read_only_without_a_password(db: Database) -> None:
+    import httpx
+
+    from web.app import create_app
+
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.restore()
+    app = create_app(agent.dashboard, db.engine, controls=agent, password=None)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as http:
+        response = await http.post("/controls/mode", data={"mode": "live"})
+    assert "Set DASHBOARD_PASSWORD" in response.text and agent.client.is_paper

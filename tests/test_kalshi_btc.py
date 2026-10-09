@@ -225,46 +225,82 @@ async def test_live_get_balance_sends_signed_request(
     verify_signature(private_key, request.headers["KALSHI-ACCESS-SIGNATURE"], f"{ts}GET/trade-api/v2/portfolio/balance")
 
 
-@pytest.mark.parametrize(("side", "price_field"), [("yes", "yes_price"), ("no", "no_price")])
-async def test_live_submit_order_posts_limit_order(
-    signer: KalshiRequestSigner, side: str, price_field: str
+@pytest.mark.parametrize(("side", "book_side", "yes_price"), [("yes", "bid", "0.4200"), ("no", "ask", "0.5800")])
+async def test_live_submit_order_posts_v2_immediate_or_cancel(
+    signer: KalshiRequestSigner, side: str, book_side: str, yes_price: str
 ) -> None:
-    def respond(request: httpx.Request) -> dict[str, Any]:
-        body = json.loads(request.content)
-        return {
-            "order": {
+    recorder = Recorder(
+        {
+            ("POST", "/trade-api/v2/portfolio/events/orders"): lambda request: {
                 "order_id": "ord-1",
-                "client_order_id": body["client_order_id"],
-                "ticker": body["ticker"],
-                "side": body["side"],
-                "action": "buy",
-                "status": "resting",
-                price_field: body[price_field],
-                "initial_count": body["count"],
-                "remaining_count": body["count"],
+                "client_order_id": json.loads(request.content)["client_order_id"],
+                "fill_count": "0.00",
+                "remaining_count": "0.00",
+                "ts_ms": 1,
             }
         }
-
-    recorder = Recorder({("POST", "/trade-api/v2/portfolio/orders"): respond})
+    )
     order = OrderRequest(ticker=TICKER, side=side, count=4, max_cost_cents=170, kelly_fraction=0.1, reasoning="t")
     async with make_client(recorder, signer=signer, trading_enabled=True) as client:
-        result = await client.submit_order(order, client_order_id="cid-1")
+        result = await client.submit_order(order, client_order_id="cid-1", exchange_index=2)
 
     sent = json.loads(recorder.requests[0].content)
+    # Order V2 quotes the YES leg: buying NO at 42c (170 // 4) is an ask on YES at 58c.
     assert sent == {
         "ticker": TICKER,
         "client_order_id": "cid-1",
-        "action": "buy",
-        "side": side,
-        "count": 4,
-        "type": "limit",
-        price_field: 42,  # 170 // 4
+        "side": book_side,
+        "count": "4.00",
+        "price": yes_price,
+        "time_in_force": "immediate_or_cancel",
+        "self_trade_prevention_type": "taker_at_cross",
+        "exchange_index": 2,
     }
-    assert result.order_id == "ord-1"
-    assert result.price_cents == 42
-    assert result.status == "resting"
-    assert result.filled_count == 0
-    assert not result.paper
+    assert (result.order_id, result.price_cents, result.filled_count, result.status) == ("ord-1", 42, 0, "canceled")
+    assert not result.paper and result.avg_fill_price_cents is None
+    assert len(recorder.requests) == 1  # no fills lookup when nothing filled
+
+
+async def test_live_fill_price_and_fee_come_from_the_fills_ledger(signer: KalshiRequestSigner) -> None:
+    fills = {
+        "fills": [
+            {"order_id": "ord-2", "count_fp": "2.00", "yes_price_dollars": "0.5900", "no_price_dollars": "0.4100", "fee_cost": "0.0300"},
+            {"order_id": "ord-2", "count_fp": "1.00", "yes_price_dollars": "0.5800", "no_price_dollars": "0.4200", "fee_cost": "0.0200"},
+            {"order_id": "other", "count_fp": "9.00", "yes_price_dollars": "0.1000", "no_price_dollars": "0.9000", "fee_cost": "0.5000"},
+        ]
+    }
+    recorder = Recorder(
+        {
+            ("POST", "/trade-api/v2/portfolio/events/orders"): {
+                "order_id": "ord-2", "fill_count": "3.00", "remaining_count": "0.00",
+                "average_fill_price": "0.5867", "average_fee_paid": "0.0167", "ts_ms": 1,
+            },
+            ("GET", "/trade-api/v2/portfolio/fills"): fills,
+        }
+    )
+    order = OrderRequest(ticker=TICKER, side="no", count=4, max_cost_cents=4 * 42, kelly_fraction=0.1, reasoning="t")
+    async with make_client(recorder, signer=signer, trading_enabled=True) as client:
+        result = await client.submit_order(order)
+
+    assert recorder.requests[1].url.params["order_id"] == "ord-2"
+    assert (result.status, result.filled_count) == ("partial", 3)
+    assert result.avg_fill_price_cents == pytest.approx((2 * 41 + 1 * 42) / 3)  # NO-side price
+    assert result.fees_cents == 5
+
+
+async def test_live_balance_can_be_scoped_to_an_exchange_shard(signer: KalshiRequestSigner) -> None:
+    recorder = Recorder(
+        {
+            ("GET", "/trade-api/v2/portfolio/balance"): lambda request: {
+                "balance": 2829 if request.url.params.get("exchange_index") == "2" else 43058
+            },
+            ("GET", "/trade-api/v2/series/KXBTC15M"): {"series": {"ticker": "KXBTC15M", "exchange_index": 2}},
+        }
+    )
+    async with make_client(recorder, signer=signer, trading_enabled=True) as client:
+        assert await client.get_series_exchange_index("KXBTC15M") == 2
+        assert await client.get_balance(exchange_index=2) == 2829
+        assert await client.get_balance() == 43058
 
 
 async def test_live_cancel_order_sends_delete(signer: KalshiRequestSigner) -> None:

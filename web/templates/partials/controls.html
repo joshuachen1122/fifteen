@@ -1,0 +1,40 @@
+{% set c = controls_ctx %}
+{% if c and c.available %}
+<section id="controls-panel" class="panel wide controls" hx-get="/partials/controls" hx-trigger="every 10s" hx-swap="outerHTML">
+  <h2>Trading controls</h2>
+  <div class="toolbar">
+    {% if c.mode == "live" %}
+      <span class="pill critical">● LIVE · real money{% if c.exchange_index is not none %} · Kalshi exchange {{ c.exchange_index }}{% endif %}</span>
+    {% else %}
+      <span class="pill warning">PAPER · simulated fills</span>
+    {% endif %}
+    <span class="muted">
+      Spent today {{ "${:,.2f}".format(c.spent_today_usd) }} of {{ "${:,.2f}".format(c.max_daily_trade_usd) }}
+      {% if c.remaining_today_usd is not none %}({{ "${:,.2f}".format(c.remaining_today_usd) }} left){% endif %}
+      · max {{ "${:,.2f}".format(c.max_trade_usd) }} per trade (price + fee)
+      {% if c.cash_usd is not none %} · {{ "cash on exchange" if c.mode == "live" else "paper cash" }} {{ "${:,.2f}".format(c.cash_usd) }}{% endif %}
+    </span>
+  </div>
+  {% if c.error %}<div class="error" style="margin-bottom: 10px;">✕ {{ c.error }}</div>{% endif %}
+  {% if c.notice %}<div class="delta-up" style="margin-bottom: 10px;">✓ {{ c.notice }}</div>{% endif %}
+
+  {% if c.editable %}
+  <form hx-post="/controls/limits" hx-target="#controls-panel" hx-swap="outerHTML">
+    <label>Max per trade (USD)<input name="max_trade_usd" type="number" min="0.01" step="0.01" value="{{ '%.2f' | format(c.max_trade_usd) }}"></label>
+    <label>Max per day (USD)<input name="max_daily_trade_usd" type="number" min="0.01" step="0.01" value="{{ '%.2f' | format(c.max_daily_trade_usd) }}"></label>
+    <button type="submit" class="secondary-btn">Save caps</button>
+    {% if c.mode == "live" %}
+      <button type="button" hx-post="/controls/mode" hx-vals='{"mode": "paper"}' hx-target="#controls-panel" hx-swap="outerHTML">Switch to paper</button>
+    {% elif c.live_blocked_reason %}
+      <button type="button" class="danger" disabled title="{{ c.live_blocked_reason }}">Switch to LIVE</button>
+      <span class="muted">Live trading unavailable: {{ c.live_blocked_reason }}.</span>
+    {% else %}
+      <button type="button" class="danger" hx-post="/controls/mode" hx-vals='{"mode": "live"}' hx-target="#controls-panel" hx-swap="outerHTML"
+              hx-confirm="Switch to LIVE trading with real money? Orders will be capped at ${{ '%.2f' | format(c.max_trade_usd) }} each and ${{ '%.2f' | format(c.max_daily_trade_usd) }} per day.">Switch to LIVE</button>
+    {% endif %}
+  </form>
+  {% else %}
+    <div class="muted">Read-only: set the DASHBOARD_PASSWORD secret to lock this dashboard and enable controls.</div>
+  {% endif %}
+</section>
+{% endif %}
