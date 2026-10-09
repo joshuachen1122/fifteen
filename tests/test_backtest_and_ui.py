@@ -18,7 +18,7 @@ from core.schemas import Btc15mMarketState, BtcSpotTick, FairValueOutput, LLMVer
 from db.models import BtcPriceHistory, StrategyParametersRecord, TradeRecord
 from db.session import init_db
 from services.backtester import SECONDS_PER_YEAR, Backtester, digital_option_probability
-from services.llm_evaluator import LLMEvaluator, evaluate_btc_trade
+from services.llm_evaluator import LLMEvaluator, LLMUsage, evaluate_btc_trade
 from services.optimizer import Optimizer, ParameterGrid, load_active_parameters
 from services.risk_engine import RiskEngine, kalshi_taker_fee_cents, kelly_fraction
 from web.app import DashboardState, create_app
@@ -323,7 +323,9 @@ async def test_llm_evaluator_returns_parsed_verdict_and_sends_risk_prompt():
     assert call["model"] == "claude-sonnet-5-5"
     assert call["output_format"] is LLMVerdict
     assert call["fallbacks"] == "default"
-    system = call["system"].lower()
+    [system_block] = call["system"]
+    assert system_block["cache_control"] == {"type": "ephemeral"}
+    system = system_block["text"].lower()
     for check in ("macro news", "liquidation cascade", "volatility regime"):
         assert check in system
     user = call["messages"][0]["content"]
@@ -439,3 +441,19 @@ def test_optimize_button_runs_backtest_sub_agent(dashboard):
     params = client.get("/api/parameters").json()
     assert params["min_gross_edge"] in SMALL_GRID.min_gross_edge
     assert params["volatility_lookback_sec"] in SMALL_GRID.volatility_lookback_sec
+
+
+async def test_evaluator_reports_usage_and_cost():
+    usage = SimpleNamespace(
+        input_tokens=420, output_tokens=290, cache_read_input_tokens=1170, cache_creation_input_tokens=0
+    )
+    response = SimpleNamespace(stop_reason="end_turn", parsed_output=APPROVE, usage=usage, model="claude-sonnet-5-5")
+    verdict, billed = await LLMEvaluator(client=fake_client(response)).evaluate_with_usage(fair_value(0.62), CONTEXT)
+    assert verdict == APPROVE and billed is not None
+    assert billed.cost_usd == pytest.approx((420 * 2.00 + 290 * 10.00 + 1170 * 0.20) / 1_000_000)
+
+
+def test_unknown_fallback_model_is_priced_conservatively():
+    known = LLMUsage(model="claude-sonnet-5-5", input_tokens=1000, output_tokens=100)
+    unknown = LLMUsage(model="some-fallback-model", input_tokens=1000, output_tokens=100)
+    assert unknown.cost_usd > known.cost_usd

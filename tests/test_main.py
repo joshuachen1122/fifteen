@@ -16,14 +16,15 @@ from execution.kalshi_client import KalshiClient, KalshiMarket
 from execution.order_scanner import OrderBook, ScanCandidate
 from main import Settings, TradingAgent
 from services.btc_spot_feed import BtcSpotFeed
+from services.llm_evaluator import LLMUsage
 from services.optimizer import Optimizer, ParameterGrid
 from services.risk_engine import RiskEngine, kalshi_taker_fee_cents
 
 T0 = datetime(2026, 10, 9, 14, 0, tzinfo=timezone.utc)
 TICKER = "KXBTC15M-26OCT091415-B82500"
 STRIKE = 82_500.0
-YES_ASK = 45  # best NO bid 55
-YES_BID = 40
+YES_ASK = 80  # best NO bid 20; the model says ~95% YES, so a ~15-point edge
+YES_BID = 76
 
 
 class Clock:
@@ -34,21 +35,28 @@ class Clock:
         return self.now
 
 
+# Token counts measured on the deployed evaluator (Sonnet 5.5, effort medium).
+CALL_USAGE = LLMUsage(model="claude-sonnet-5-5", input_tokens=1590, output_tokens=290)
+
+
 class FakeEvaluator:
     def __init__(self, should_bet: bool = True, probability_shift: float = 0.0) -> None:
         self.should_bet = should_bet
         self.probability_shift = probability_shift
         self.calls: list[tuple[FairValueOutput, dict[str, Any]]] = []
 
-    async def evaluate(self, candidate: FairValueOutput, context: dict[str, Any]) -> LLMVerdict:
+    async def evaluate_with_usage(
+        self, candidate: FairValueOutput, context: dict[str, Any]
+    ) -> tuple[LLMVerdict, LLMUsage]:
         self.calls.append((candidate, context))
-        return LLMVerdict(
+        verdict = LLMVerdict(
             should_bet=self.should_bet,
             adjusted_probability=min(max(candidate.model_probability + self.probability_shift, 0.01), 0.99),
             confidence_score=0.8,
             reasoning="approved" if self.should_bet else "macro news window",
             risk_signals=[] if self.should_bet else ["Macro news window"],
         )
+        return verdict, CALL_USAGE
 
 
 class SettlingClient(KalshiClient):
@@ -186,7 +194,7 @@ async def test_missing_llm_fails_closed(db: Database) -> None:
 async def test_cooldown_limits_llm_calls_per_ticker_side(db: Database) -> None:
     clock = Clock(T0)
     evaluator = FakeEvaluator(should_bet=False)
-    agent = make_agent(db, clock, evaluator, llm_cooldown_sec=60)
+    agent = make_agent(db, clock, evaluator, llm_cooldown_sec=60, llm_reask_edge_step=-1.0)  # isolate the cooldown
     await agent.restore()
 
     await agent.handle_candidate(yes_candidate(agent))
@@ -286,3 +294,154 @@ async def test_restore_rebuilds_open_positions_and_bankroll(db: Database) -> Non
     assert second.risk.cash_cents == first.risk.cash_cents
     assert await second.client.get_balance() == second.risk.cash_cents
     assert second._has_position(TICKER)
+
+
+async def test_llm_usage_is_recorded_per_evaluation(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator(should_bet=False))
+    await agent.restore()
+    await agent.handle_candidate(yes_candidate(agent))
+    async with db.session() as s:
+        trace = (await s.exec(select(EvaluationTraceRecord))).one()
+    assert (trace.llm_model, trace.llm_input_tokens, trace.llm_output_tokens) == ("claude-sonnet-5-5", 1590, 290)
+    assert trace.llm_cost_usd == pytest.approx(CALL_USAGE.cost_usd)
+    assert agent.llm_spend_today(clock.now) == pytest.approx(CALL_USAGE.cost_usd)
+
+
+async def test_vetoed_candidate_is_not_re_asked_without_a_material_edge_change(db: Database) -> None:
+    clock = Clock(T0)
+    evaluator = FakeEvaluator(should_bet=False)
+    agent = make_agent(db, clock, evaluator, llm_cooldown_sec=0)
+    await agent.restore()
+    first = yes_candidate(agent)
+    await agent.handle_candidate(first)
+    advance(agent, clock, timedelta(seconds=5))
+    await agent.handle_candidate(yes_candidate(agent))
+    assert len(evaluator.calls) == 1 and agent.llm_screened["vetoed_no_material_change"] == 1
+
+    better = first.model_copy(update={"edge": first.edge + 0.03})
+    await agent.handle_candidate(better)
+    assert len(evaluator.calls) == 2
+
+
+async def test_per_market_llm_call_cap(db: Database) -> None:
+    clock = Clock(T0)
+    evaluator = FakeEvaluator(should_bet=False)
+    agent = make_agent(db, clock, evaluator, llm_cooldown_sec=0, llm_max_calls_per_market=2, llm_reask_edge_step=0)
+    await agent.restore()
+    for _ in range(4):
+        await agent.handle_candidate(yes_candidate(agent))
+    assert len(evaluator.calls) == 2 and agent.llm_screened["market_call_cap"] == 2
+
+
+async def test_implausible_edges_and_near_expiry_are_screened_for_free(db: Database) -> None:
+    clock = Clock(T0)
+    evaluator = FakeEvaluator()
+    agent = make_agent(db, clock, evaluator)
+    await agent.restore()
+    c = yes_candidate(agent)
+    await agent.handle_candidate(c.model_copy(update={"edge": 0.45}))
+    late = c.market_state.model_copy(update={"seconds_remaining": 45})
+    await agent.handle_candidate(c.model_copy(update={"market_state": late}))
+    assert evaluator.calls == []
+    assert agent.llm_screened == {"edge_implausible": 1, "too_close_to_expiry": 1}
+    assert await trade_rows(db) == []
+
+
+async def test_daily_llm_budget_fails_closed_and_resets_next_day(db: Database) -> None:
+    clock = Clock(T0)
+    evaluator = FakeEvaluator()
+    agent = make_agent(db, clock, evaluator, llm_daily_budget_usd=CALL_USAGE.cost_usd * 0.5)
+    await agent.restore()
+    await agent.handle_candidate(yes_candidate(agent))  # first call is allowed, then the budget is spent
+    assert len(evaluator.calls) == 1
+
+    other = make_agent(db, clock, evaluator, llm_daily_budget_usd=CALL_USAGE.cost_usd * 0.5)
+    await other.restore()  # spend survives a restart
+    assert other.llm_spend_today(clock.now) == pytest.approx(CALL_USAGE.cost_usd)
+    candidate = yes_candidate(other).model_copy(update={"ticker": "KXBTC15M-26OCT091430-B82500"})
+    await other.handle_candidate(candidate)
+    assert len(evaluator.calls) == 1 and other.llm_screened["daily_budget_exhausted"] == 1
+
+    clock.now += timedelta(days=1)
+    assert other.llm_spend_today(clock.now) == 0.0
+
+
+async def test_dashboard_stats_summarize_pnl_bets_and_llm_spend(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.restore()
+    await agent.handle_candidate(yes_candidate(agent))
+    [row] = await trade_rows(db)
+
+    clock.now = T0 + timedelta(minutes=11)
+    assert isinstance(agent.client, SettlingClient)
+    agent.client.results[TICKER] = KalshiMarket(ticker=TICKER, strike_price=STRIKE, close_time=T0, result="yes")
+    await agent.settle_completed()
+    agent.llm_screened["edge_implausible"] += 3
+    await agent.refresh_stats()
+
+    stats = agent.dashboard.stats
+    assert stats is not None
+    pnl = row.filled_count * (100 - YES_ASK) - row.fees_cents
+    assert stats.total_pnl == pytest.approx(pnl / 100)
+    assert (stats.bets_made, stats.bets_settled, stats.wins, stats.win_rate_pct) == (1, 1, 1, 100.0)
+    assert stats.return_pct == pytest.approx(pnl / 100_000 * 100)
+    assert (stats.llm_calls, stats.llm_approvals, stats.approval_rate_pct) == (1, 1, 100.0)
+    assert stats.llm_cost_total == pytest.approx(CALL_USAGE.cost_usd)
+    assert stats.pnl_after_llm == pytest.approx(pnl / 100 - CALL_USAGE.cost_usd)
+    assert stats.candidates_screened == 3
+    # One call in an 11-minute window, extrapolated to 30 days.
+    assert stats.projected_monthly_cost == pytest.approx(CALL_USAGE.cost_usd / (11 / 60) * 720, rel=1e-3)
+
+
+async def test_init_adds_new_columns_to_an_existing_database(tmp_path) -> None:
+    import sqlite3
+
+    new_columns = ["llm_model", "llm_input_tokens", "llm_output_tokens", "llm_cache_read_tokens",
+                   "llm_cache_write_tokens", "llm_cost_usd"]
+    path = tmp_path / "old.db"
+    url = f"sqlite+aiosqlite:///{path}"
+    database = Database(url)
+    await database.init()
+    await database.dispose()
+    with sqlite3.connect(path) as conn:  # rewind evaluation_traces to the previous release's schema
+        for column in new_columns:
+            conn.execute(f"ALTER TABLE evaluation_traces DROP COLUMN {column}")
+        conn.execute(
+            "INSERT INTO evaluation_traces (created_at, ticker, strike_price, expiration_time, seconds_remaining,"
+            " current_spot_price, historical_volatility, momentum_1m, order_book_imbalance, model_probability,"
+            " fair_cents, gross_edge, volatility_used, d2_score, llm_risk_signals, decision)"
+            " VALUES ('2026-10-09 19:40:54', 'KXBTC15M-OLD', 82500, '2026-10-09 19:45:00', 250, 82450, 0.27,"
+            " 0.0, 0.0, 0.28, 28, 0.22, 0.27, -0.6, '[]', 'skip')"
+        )
+
+    database = Database(url)
+    await database.init()
+    await database.dispose()
+    with sqlite3.connect(path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(evaluation_traces)")}
+        assert set(new_columns) <= columns
+        assert conn.execute("SELECT ticker, llm_cost_usd FROM evaluation_traces").fetchall() == [("KXBTC15M-OLD", None)]
+
+
+async def test_stats_panel_renders(db: Database) -> None:
+    import httpx
+
+    from web.app import create_app
+
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.restore()
+    app = create_app(agent.dashboard, db.engine)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http:
+        empty = await http.get("/partials/stats")
+        assert empty.status_code == 200 and "Collecting stats" in empty.text
+
+        await agent.handle_candidate(yes_candidate(agent))
+        agent.llm_screened["vetoed_no_material_change"] += 2
+        await agent.refresh_stats()
+        page = await http.get("/partials/stats")
+    assert page.status_code == 200
+    for text in ("Total PnL", "Bets made", "LLM calls", "Projected / month", "PAPER", "vetoed no material change"):
+        assert text in page.text

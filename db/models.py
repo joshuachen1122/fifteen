@@ -95,6 +95,14 @@ class EvaluationTraceRecord(SQLModel, table=True):
     llm_reasoning: Optional[str] = None
     llm_risk_signals: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
 
+    # LLM billing; null when the LLM was not consulted or the call was not billed
+    llm_model: Optional[str] = None
+    llm_input_tokens: Optional[int] = None  # uncached input only
+    llm_output_tokens: Optional[int] = None
+    llm_cache_read_tokens: Optional[int] = None
+    llm_cache_write_tokens: Optional[int] = None
+    llm_cost_usd: Optional[float] = None
+
     # Final decision
     decision: str = Field(index=True)  # "trade" | "skip"
     skip_reason: Optional[str] = None

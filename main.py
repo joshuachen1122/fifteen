@@ -21,14 +21,16 @@ import contextlib
 import logging
 import os
 import signal
+from collections import Counter
 from collections.abc import Callable, Iterator
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from typing import Any, Literal, Optional
 
 import uvicorn
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy import func
 from sqlmodel import col, select
 
 from core.constants import DEFAULT_DATABASE_URL, SPOT_SOURCE_COINBASE
@@ -41,7 +43,8 @@ from execution.order_scanner import KalshiOrderBookScanner, ScanCandidate, SpotC
 from pricing.btc_digital_option import price_digital_option
 from pricing.greeks import MIN_ENTRY_SECONDS, check_entry_guardrail
 from services.btc_spot_feed import BtcSpotFeed
-from services.llm_evaluator import LLMEvaluator
+from services.agent_stats import compute_stats
+from services.llm_evaluator import LLMEvaluator, LLMUsage
 from services.optimizer import Optimizer, load_active_parameters
 from services.risk_engine import Position, RiskEngine, kalshi_taker_fee_cents
 from web.app import DashboardState, create_app
@@ -59,9 +62,17 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # Trading loop
-    llm_cooldown_sec: float = 60.0  # min gap between LLM evaluations of the same ticker/side
     spot_persist_interval_sec: float = 5.0
     dashboard_refresh_sec: float = 1.0
+    stats_refresh_sec: float = 10.0
+
+    # LLM spend controls. Candidates are screened with these free checks before any paid call.
+    llm_cooldown_sec: float = 60.0  # min gap between LLM evaluations of the same ticker/side
+    llm_max_calls_per_market: int = 4  # per 15-minute contract
+    llm_reask_edge_step: float = 0.02  # after a veto, re-ask only once the edge improves this much
+    llm_min_seconds_remaining: int = 60  # too little time left to act on a verdict
+    max_plausible_edge: float = 0.30  # larger "edges" are almost always bad quotes, not mispricing
+    llm_daily_budget_usd: float = 5.0  # hard cap; past it the agent fails closed (no LLM, no trades)
 
     # Settlement & auto-tuning
     settlement_poll_sec: float = 180.0
@@ -116,6 +127,12 @@ class TradingAgent:
         self._positions: dict[int, Position] = {}  # TradeRecord.id -> open position
         self._trade_rows: dict[str, int] = {}  # ticker -> its single TradeRecord.id
         self._last_evaluated: dict[tuple[str, str], datetime] = {}
+        self._vetoed_edge: dict[tuple[str, str], float] = {}  # edge at the last LLM veto
+        self._llm_calls: Counter[str] = Counter()  # per ticker
+        self._llm_spend_day: Optional[date] = None
+        self._llm_spend_today_usd = 0.0
+        self.llm_screened: Counter[str] = Counter()  # candidates rejected before a paid call, by reason
+        self._initial_bankroll_cents = 0
         self._inflight: set[str] = set()
         self._handlers: set[asyncio.Task[None]] = set()
         self._order_lock = asyncio.Lock()  # sizing must see the bankroll left by the previous fill
@@ -172,6 +189,7 @@ class TradingAgent:
         # Paper balances restart from PAPER_STARTING_BALANCE_CENTS, so replay realized PnL onto
         # them; a live Kalshi balance already reflects settlements but excludes open positions.
         starting = balance + settled_pnl if self.client.is_paper else balance + open_cost
+        self._initial_bankroll_cents = starting - settled_pnl
         self.risk = RiskEngine(starting, now=now)
         for row in open_rows:
             assert row.id is not None and row.side is not None
@@ -187,6 +205,7 @@ class TradingAgent:
         if self.client.is_paper:
             self.client.credit_paper_balance(self.risk.cash_cents - balance)
         self._trade_rows = {r.ticker: r.id for r in active_rows if r.id is not None}
+        await self._load_llm_spend(now)
 
         logger.info(
             "restored %s bankroll: equity $%.2f, %d open position(s)",
@@ -250,16 +269,49 @@ class TradingAgent:
                 logger.exception("market sync failed")
             await asyncio.sleep(self.settings.dashboard_refresh_sec)
 
+    async def stats_loop(self) -> None:
+        while True:
+            try:
+                await self.refresh_stats()
+            except Exception:
+                logger.exception("stats refresh failed")
+            await asyncio.sleep(self.settings.stats_refresh_sec)
+
+    async def refresh_stats(self) -> None:
+        assert self.risk is not None
+        now = self._clock()
+        async with self.db.session() as session:
+            self.dashboard.stats = await compute_stats(
+                session,
+                now=now,
+                is_paper=self.client.is_paper,
+                initial_bankroll_cents=self._initial_bankroll_cents,
+                equity_cents=self.risk.equity_cents,
+                open_positions=len(self._positions),
+                open_exposure_cents=self.risk.open_exposure_cents,
+                halted=self.risk.is_trading_halted(now),
+                llm_daily_budget_usd=self.settings.llm_daily_budget_usd,
+                llm_screened=dict(self.llm_screened),
+            )
+
     async def sync_markets(self) -> None:
         for ticker in set(self.state_manager.active_tickers()) - set(self.scanner.markets):
             await self.state_manager.remove_market(ticker)
+        # Per-contract LLM bookkeeping is only needed while the contract trades.
+        live = set(self.scanner.markets)
+        for key in [k for k in self._last_evaluated if k[0] not in live]:
+            del self._last_evaluated[key]
+        for key in [k for k in self._vetoed_edge if k[0] not in live]:
+            del self._vetoed_edge[key]
+        for ticker in [t for t in self._llm_calls if t not in live]:
+            del self._llm_calls[ticker]
         await self.state_manager.prune_expired()
         for ticker, market in list(self.scanner.markets.items()):
             if market.close_time <= self._clock():
                 continue
             await self.state_manager.upsert_market(ticker, market.strike_price, market.close_time)
             book = self.scanner.books.get(ticker)
-            if book is None or book.best_yes_bid is None or book.best_yes_ask is None:
+            if book is None or book.best_yes_bid is None or book.best_yes_ask is None or book.is_crossed:
                 continue
             quote = MarketQuote(
                 ticker=ticker,
@@ -312,8 +364,18 @@ class TradingAgent:
             logger.warning("daily drawdown kill switch active; ignoring %s %s", c.ticker, c.side)
             return
 
+        screen = self._llm_screen(c, now)
+        if screen is not None:
+            self.llm_screened[screen] += 1
+            return
+
         self._last_evaluated[(c.ticker, c.side)] = now
-        verdict = await self._llm_verdict(c, guard.greeks.delta)
+        verdict, usage = await self._llm_verdict(c, guard.greeks.delta)
+        if usage is not None:
+            self._llm_calls[c.ticker] += 1
+            self._add_llm_spend(usage.cost_usd, now)
+            if not verdict.should_bet:
+                self._vetoed_edge[(c.ticker, c.side)] = c.edge
         params = self.params
 
         # The book may have moved while the LLM was thinking: re-read it before committing.
@@ -352,25 +414,67 @@ class TradingAgent:
                     if position is None:
                         skip_reason = "order_not_filled"
 
-        evaluation_id = await self._record_evaluation(c, verdict, skip_reason)
+        evaluation_id = await self._record_evaluation(c, verdict, usage, skip_reason)
         await self._record_trade(c, evaluation_id, ask, order, result, position, now)
 
-    async def _llm_verdict(self, c: ScanCandidate, delta: float) -> LLMVerdict:
+    def _llm_screen(self, c: ScanCandidate, now: datetime) -> Optional[str]:
+        """Free checks that decide whether a candidate is worth a paid LLM call. Returns the reason to skip."""
+        s = self.settings
+        if c.edge > s.max_plausible_edge:
+            return "edge_implausible"
+        if c.market_state.seconds_remaining < s.llm_min_seconds_remaining:
+            return "too_close_to_expiry"
+        if self._llm_calls[c.ticker] >= s.llm_max_calls_per_market:
+            return "market_call_cap"
+        vetoed = self._vetoed_edge.get((c.ticker, c.side))
+        if vetoed is not None and c.edge < vetoed + s.llm_reask_edge_step:
+            return "vetoed_no_material_change"
+        if self.llm_spend_today(now) >= s.llm_daily_budget_usd:
+            if self.llm_screened["daily_budget_exhausted"] == 0:
+                logger.warning("LLM daily budget of $%.2f exhausted; no new trades today", s.llm_daily_budget_usd)
+            return "daily_budget_exhausted"
+        return None
+
+    def llm_spend_today(self, now: datetime) -> float:
+        if self._llm_spend_day != now.date():
+            self._llm_spend_day, self._llm_spend_today_usd = now.date(), 0.0
+            self.llm_screened.pop("daily_budget_exhausted", None)
+        return self._llm_spend_today_usd
+
+    def _add_llm_spend(self, cost_usd: float, now: datetime) -> None:
+        self._llm_spend_today_usd = self.llm_spend_today(now) + cost_usd
+
+    async def _load_llm_spend(self, now: datetime) -> None:
+        midnight = datetime.combine(now.date(), time.min, tzinfo=timezone.utc)
+        async with self.db.session() as session:
+            spent = (
+                await session.exec(
+                    select(func.coalesce(func.sum(EvaluationTraceRecord.llm_cost_usd), 0.0)).where(
+                        EvaluationTraceRecord.created_at >= midnight
+                    )
+                )
+            ).one()
+        self._llm_spend_day, self._llm_spend_today_usd = now.date(), float(spent)
+
+    async def _llm_verdict(self, c: ScanCandidate, delta: float) -> tuple[LLMVerdict, Optional[LLMUsage]]:
         if self.evaluator is None:
-            return LLMVerdict(
+            verdict = LLMVerdict(
                 should_bet=False,
                 adjusted_probability=min(max(c.fair_value.model_probability, 0.01), 0.99),
                 confidence_score=0.0,
                 reasoning="ANTHROPIC_API_KEY not configured; vetoing by default.",
                 risk_signals=["LLM unavailable"],
             )
+            return verdict, None
         assert self.risk is not None
         state = c.market_state
         context = {
+            "note": "The candidate's model_probability, fair_cents and gross_edge are for the YES side. "
+            "proposed_side_* fields are for the side being bought (NO ask = 100 - yes_bid).",
             "proposed_side": c.side,
-            "ask_cents": c.ask_cents,
-            "side_win_probability": round(c.model_probability, 4),
-            "gross_edge": round(c.edge, 4),
+            "proposed_side_ask_cents": c.ask_cents,
+            "proposed_side_win_probability": round(c.model_probability, 4),
+            "proposed_side_gross_edge": round(c.edge, 4),
             "min_gross_edge": self.params.min_gross_edge,
             "yes_bid": c.quote.yes_bid,
             "yes_ask": c.quote.yes_ask,
@@ -387,7 +491,7 @@ class TradingAgent:
             "open_positions": len(self._positions),
             "utc_time": self._clock().isoformat(),
         }
-        return await self.evaluator.evaluate(c.fair_value, context)
+        return await self.evaluator.evaluate_with_usage(c.fair_value, context)
 
     def _current_ask(self, ticker: str, side: Side) -> Optional[int]:
         book = self.scanner.books.get(ticker)
@@ -436,9 +540,12 @@ class TradingAgent:
     def _has_position(self, ticker: str) -> bool:
         return any(p.ticker == ticker for p in self._positions.values())
 
-    async def _record_evaluation(self, c: ScanCandidate, verdict: LLMVerdict, skip_reason: Optional[str]) -> int:
+    async def _record_evaluation(
+        self, c: ScanCandidate, verdict: LLMVerdict, usage: Optional[LLMUsage], skip_reason: Optional[str]
+    ) -> int:
         s, fv = c.market_state, c.fair_value
         record = EvaluationTraceRecord(
+            created_at=self._clock(),
             ticker=c.ticker,
             strike_price=s.strike_price,
             expiration_time=s.expiration_time,
@@ -459,6 +566,12 @@ class TradingAgent:
             llm_confidence_score=verdict.confidence_score,
             llm_reasoning=verdict.reasoning,
             llm_risk_signals=verdict.risk_signals,
+            llm_model=usage.model if usage else None,
+            llm_input_tokens=usage.input_tokens if usage else None,
+            llm_output_tokens=usage.output_tokens if usage else None,
+            llm_cache_read_tokens=usage.cache_read_tokens if usage else None,
+            llm_cache_write_tokens=usage.cache_write_tokens if usage else None,
+            llm_cost_usd=usage.cost_usd if usage else None,
             decision="skip" if skip_reason else "trade",
             skip_reason=skip_reason,
         )
@@ -625,6 +738,7 @@ class TradingAgent:
             asyncio.create_task(self.scanner.run(), name="kalshi-scanner"),
             asyncio.create_task(self.persist_spot_loop(), name="spot-persist"),
             asyncio.create_task(self.dashboard_loop(), name="dashboard-sync"),
+            asyncio.create_task(self.stats_loop(), name="dashboard-stats"),
             asyncio.create_task(self.settlement_loop(), name="settlement-poller"),
         ]
 

@@ -4,9 +4,12 @@ Fails closed: any API error, refusal, truncation, or unparseable response yields
 veto verdict rather than an exception, so a flaky LLM can never green-light a trade.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import anthropic
@@ -58,6 +61,49 @@ value if you see no reason to move it.
 """
 
 
+# USD per million tokens: (input, output, cache read). Cache writes (5-minute TTL) bill 1.25x input.
+PRICING_PER_MTOK: dict[str, tuple[float, float, float]] = {
+    "claude-sonnet-5-5": (2.00, 10.00, 0.20),
+    "claude-haiku-5-5": (0.10, 0.50, 0.01),
+    "claude-opus-5-5": (4.00, 20.00, 0.20),
+}
+# Server-side fallbacks may answer from a model not listed above; price those at Opus rates so
+# spend is over- rather than under-counted.
+_UNKNOWN_MODEL_PRICING = PRICING_PER_MTOK["claude-opus-5-5"]
+
+
+@dataclass(frozen=True)
+class LLMUsage:
+    model: str
+    input_tokens: int = 0  # uncached input only
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+    @property
+    def cost_usd(self) -> float:
+        inp, out, cache_read = PRICING_PER_MTOK.get(self.model, _UNKNOWN_MODEL_PRICING)
+        return (
+            self.input_tokens * inp
+            + self.output_tokens * out
+            + self.cache_read_tokens * cache_read
+            + self.cache_write_tokens * inp * 1.25
+        ) / 1_000_000
+
+    @classmethod
+    def from_response(cls, response: Any, requested_model: str) -> Optional[LLMUsage]:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        return cls(
+            model=getattr(response, "model", None) or requested_model,
+            input_tokens=getattr(usage, "input_tokens", 0) or 0,
+            output_tokens=getattr(usage, "output_tokens", 0) or 0,
+            cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+            cache_write_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        )
+
+
 def _veto(reason: str, signal: str, fallback_probability: float) -> LLMVerdict:
     return LLMVerdict(
         should_bet=False,
@@ -92,6 +138,13 @@ class LLMEvaluator:
         self.effort = effort
 
     async def evaluate(self, candidate: FairValueOutput, context: dict[str, Any]) -> LLMVerdict:
+        verdict, _ = await self.evaluate_with_usage(candidate, context)
+        return verdict
+
+    async def evaluate_with_usage(
+        self, candidate: FairValueOutput, context: dict[str, Any]
+    ) -> tuple[LLMVerdict, Optional[LLMUsage]]:
+        """Like `evaluate`, plus billed token usage (None when no response was billed)."""
         model_p = candidate.model_probability
         try:
             response = await self._client.beta.messages.parse(
@@ -99,30 +152,33 @@ class LLMEvaluator:
                 max_tokens=16000,
                 betas=[FALLBACK_BETA],
                 fallbacks="default",
-                system=SYSTEM_PROMPT,
+                # The static system prompt (plus the output schema) is identical on every call;
+                # cache it so repeat calls bill it at the cache-read rate.
+                system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
                 output_config={"effort": self.effort},
                 output_format=LLMVerdict,
                 messages=[{"role": "user", "content": build_user_prompt(candidate, context)}],
             )
         except anthropic.APIStatusError as exc:
             logger.warning("LLM evaluator API error %s for %s: %s", exc.status_code, candidate.ticker, exc.message)
-            return _veto(f"LLM API error ({exc.status_code}); vetoing by default.", "LLM unavailable", model_p)
+            return _veto(f"LLM API error ({exc.status_code}); vetoing by default.", "LLM unavailable", model_p), None
         except anthropic.APIConnectionError as exc:
             logger.warning("LLM evaluator connection error for %s: %s", candidate.ticker, exc)
-            return _veto("LLM connection error; vetoing by default.", "LLM unavailable", model_p)
+            return _veto("LLM connection error; vetoing by default.", "LLM unavailable", model_p), None
         except (ValidationError, ValueError) as exc:
             logger.warning("LLM evaluator returned an invalid verdict for %s: %s", candidate.ticker, exc)
-            return _veto("LLM returned an invalid verdict; vetoing by default.", "LLM invalid output", model_p)
+            return _veto("LLM returned an invalid verdict; vetoing by default.", "LLM invalid output", model_p), None
 
+        usage = LLMUsage.from_response(response, self.model)
         if response.stop_reason == "refusal":
-            return _veto("LLM declined to evaluate; vetoing by default.", "LLM refusal", model_p)
+            return _veto("LLM declined to evaluate; vetoing by default.", "LLM refusal", model_p), usage
         if response.stop_reason == "max_tokens":
-            return _veto("LLM response was truncated; vetoing by default.", "LLM invalid output", model_p)
+            return _veto("LLM response was truncated; vetoing by default.", "LLM invalid output", model_p), usage
 
         verdict = response.parsed_output
         if verdict is None:
-            return _veto("LLM returned no verdict; vetoing by default.", "LLM invalid output", model_p)
-        return verdict
+            return _veto("LLM returned no verdict; vetoing by default.", "LLM invalid output", model_p), usage
+        return verdict, usage
 
 
 _default_evaluator: Optional[LLMEvaluator] = None

@@ -1,0 +1,65 @@
+{% macro money(v) %}{{ "−" if v < 0 else "" }}${{ "{:,.2f}".format(v | abs) }}{% endmacro %}
+{% macro signed(v) %}<span class="{{ 'delta-up' if v > 0 else ('delta-down' if v < 0 else '') }}">{{ "▲ " if v > 0 else ("▼ " if v < 0 else "") }}{{ money(v) }}</span>{% endmacro %}
+{% macro pct(v, digits=1) %}{% if v is none %}—{% else %}{{ ("%." ~ digits ~ "f") | format(v) }}%{% endif %}{% endmacro %}
+<section id="stats-panel" class="panel wide" hx-get="/partials/stats" hx-trigger="every 10s" hx-swap="outerHTML">
+  <h2>Performance &amp; LLM spend</h2>
+  {% if not stats %}
+    <div class="empty">Collecting stats…</div>
+  {% else %}
+  <div class="toolbar">
+    <span class="pill {{ 'warning' if stats.mode == 'paper' else 'critical' }}">{{ stats.mode | upper }}</span>
+    {% if stats.halted %}<span class="pill critical">✕ Daily drawdown halt</span>{% endif %}
+    {% if stats.budget_used_pct >= 100 %}<span class="pill critical">✕ LLM budget exhausted: no new trades today</span>
+    {% elif stats.budget_used_pct >= 80 %}<span class="pill warning">LLM budget {{ pct(stats.budget_used_pct, 0) }} used</span>{% endif %}
+    <span class="muted">Updated {{ stats.updated_at.strftime("%H:%M:%S") }} UTC · PnL is realized and net of Kalshi fees</span>
+  </div>
+
+  <div class="tiles">
+    <div class="tile"><div class="label">Total PnL</div><div class="value">{{ signed(stats.total_pnl) }}</div></div>
+    <div class="tile"><div class="label">Return on bankroll</div><div class="value">{{ pct(stats.return_pct, 2) }}</div></div>
+    <div class="tile"><div class="label">Equity</div><div class="value">{{ money(stats.equity) }}</div></div>
+    <div class="tile"><div class="label">Bets made</div><div class="value">{{ stats.bets_made }}</div></div>
+    <div class="tile"><div class="label">Open positions</div><div class="value">{{ stats.open_positions }}</div>
+      {% if stats.open_positions %}<div class="muted">{{ money(stats.open_exposure) }} at risk</div>{% endif %}</div>
+    <div class="tile"><div class="label">Win rate</div><div class="value">{{ pct(stats.win_rate_pct) }}</div>
+      <div class="muted">{{ stats.wins }} / {{ stats.bets_settled }} settled</div></div>
+    <div class="tile"><div class="label">ROI on staked</div><div class="value">{{ pct(stats.roi_on_staked_pct) }}</div>
+      <div class="muted">{{ money(stats.total_staked) }} staked</div></div>
+    <div class="tile"><div class="label">Fees paid</div><div class="value">{{ money(stats.fees_paid) }}</div></div>
+  </div>
+
+  <div class="tiles">
+    <div class="tile"><div class="label">LLM calls</div><div class="value">{{ "{:,}".format(stats.llm_calls) }}</div>
+      <div class="muted">{{ stats.llm_calls_today }} today</div></div>
+    <div class="tile"><div class="label">LLM approval rate</div><div class="value">{{ pct(stats.approval_rate_pct) }}</div>
+      <div class="muted">{{ stats.llm_approvals }} approved</div></div>
+    <div class="tile"><div class="label">Calls → bets</div><div class="value">{{ pct(stats.bet_per_call_pct) }}</div></div>
+    <div class="tile"><div class="label">Screened out free</div><div class="value">{{ "{:,}".format(stats.candidates_screened) }}</div>
+      <div class="muted">never sent to the LLM</div></div>
+    <div class="tile"><div class="label">LLM spend today</div><div class="value">{{ money(stats.llm_cost_today) }}</div>
+      <div class="muted">of {{ money(stats.llm_daily_budget) }} budget ({{ pct(stats.budget_used_pct, 0) }})</div></div>
+    <div class="tile"><div class="label">Projected / month</div>
+      <div class="value">{% if stats.projected_monthly_cost is none %}—{% else %}{{ money(stats.projected_monthly_cost) }}{% endif %}</div>
+      <div class="muted">{% if stats.projection_basis_hours %}from last {{ "%.1f" | format(stats.projection_basis_hours) }}h{% else %}no calls yet{% endif %}</div></div>
+    <div class="tile"><div class="label">Avg cost / call</div>
+      <div class="value">{% if stats.avg_cost_per_call is none %}—{% else %}${{ "%.4f" | format(stats.avg_cost_per_call) }}{% endif %}</div>
+      <div class="muted">cache hit {{ pct(stats.cache_hit_pct, 0) }}</div></div>
+    <div class="tile"><div class="label">PnL after LLM cost</div><div class="value">{{ signed(stats.pnl_after_llm) }}</div>
+      <div class="muted">{{ money(stats.llm_cost_total) }} LLM total{% if stats.llm_cost_pct_of_pnl is not none %} · {{ pct(stats.llm_cost_pct_of_pnl, 0) }} of PnL{% endif %}</div></div>
+  </div>
+
+  {% if stats.screened_by_reason %}
+  <details>
+    <summary>Why candidates were screened out before the LLM</summary>
+    <table>
+      <thead><tr><th>Reason</th><th>Candidates</th></tr></thead>
+      <tbody>
+        {% for reason, n in stats.screened_by_reason.items() %}
+        <tr><td>{{ reason | replace("_", " ") }}</td><td>{{ "{:,}".format(n) }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+  {% endif %}
+</section>

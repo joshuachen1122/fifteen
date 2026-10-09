@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from sqlalchemy import event
+from sqlalchemy import Connection, event, inspect, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
@@ -38,6 +38,7 @@ class Database:
     async def init(self) -> None:
         async with self.engine.begin() as conn:
             await conn.run_sync(SQLModel.metadata.create_all)
+            await conn.run_sync(_add_missing_columns)
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
@@ -46,6 +47,21 @@ class Database:
 
     async def dispose(self) -> None:
         await self.engine.dispose()
+
+
+def _add_missing_columns(conn: Connection) -> None:
+    """Additive migration: `create_all` creates missing tables but never alters existing ones, so add
+    any new nullable columns to databases created by an older version of the models."""
+    inspector = inspect(conn)
+    for table in SQLModel.metadata.sorted_tables:
+        existing = {c["name"] for c in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in existing:
+                continue
+            if not column.nullable:
+                raise RuntimeError(f"cannot auto-add NOT NULL column {table.name}.{column.name}")
+            ddl_type = column.type.compile(dialect=conn.dialect)
+            conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {ddl_type}'))
 
 
 def _sqlite_pragmas(dbapi_conn: Any, _record: Any) -> None:

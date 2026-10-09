@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from core.schemas import Btc15mMarketState, BtcSpotTick, FairValueOutput, MarketQuote, StrategyParameters
 from db.session import init_db, make_engine
+from services.agent_stats import AgentStats
 from services.optimizer import OptimizationResult, Optimizer, load_active_parameters
 from web.charts import ReferenceLine, line_chart_svg, usd, usd_cents
 
@@ -46,6 +47,7 @@ class DashboardState:
         self.optimizer_error: Optional[str] = None
         self.last_optimization: Optional[OptimizationResult] = None
         self.optimizer_task: Optional[asyncio.Task[None]] = None
+        self.stats: Optional[AgentStats] = None  # refreshed by the live trader
 
     def update_spot(self, tick: BtcSpotTick) -> None:
         self.spot = tick
@@ -159,8 +161,13 @@ def create_app(
             "spot_ctx": spot_context(),
             "markets_ctx": await markets_context(),
             "backtest_ctx": await backtest_context(),
+            "stats": state.stats,
         }
         return TEMPLATES.TemplateResponse(request, "index.html", context)
+
+    @app.get("/partials/stats", response_class=HTMLResponse)
+    async def stats_partial(request: Request) -> HTMLResponse:
+        return TEMPLATES.TemplateResponse(request, "partials/stats.html", {"stats": state.stats})
 
     @app.get("/partials/spot", response_class=HTMLResponse)
     async def spot_partial(request: Request) -> HTMLResponse:
