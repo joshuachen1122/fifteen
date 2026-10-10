@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -13,6 +14,7 @@ from sqlmodel import select
 from core.schemas import BtcSpotTick, FairValueOutput, LLMVerdict
 from db.database import Database
 from db.models import (
+    BtcPriceHistory,
     ContractOutcome,
     EvaluationReportRecord,
     EvaluationTraceRecord,
@@ -837,8 +839,7 @@ async def test_no_pricing_or_snapshots_until_volatility_has_a_full_window(db: Da
     cold = BtcSpotFeed()
     for i in range(60):  # one minute of history against a 300s lookback
         cold.buffer.add_tick(BtcSpotTick(source="coinbase", price=82_700.0 + (i % 3), timestamp=T0 - timedelta(seconds=59 - i)))
-    agent.feed = cold
-    agent.state_manager._spot = cold
+    agent.feed = agent.spot.feed = cold
     await agent.restore()
     assert not agent.spot_warm() and agent.spot_context() is None
     assert agent.scanner.evaluate(TICKER) == []
@@ -883,10 +884,10 @@ async def test_agent_follows_the_evaluation_pricing_choice_only_with_enough_evid
     settle = agent.model_values(candidate.market_state, candidate.quote)["settlement"].model_probability
     assert blended.model_probability == pytest.approx(0.4 * settle + 0.6 * mid)
     assert blended.model_probability < raw  # shrunk toward the 78c mid
-    assert agent.dashboard.pricing == {
+    assert agent.dashboard.pricing.items() >= {
         "model": "settlement", "blend_weight": 0.4, "reason": "hourly evaluation over 250 settled contracts",
         "setting_model": "auto", "setting_blend": "auto",
-    }
+    }.items()
 
 
 async def test_fixed_pricing_settings_override_the_evaluation(db: Database) -> None:
@@ -944,3 +945,40 @@ async def test_vetoed_candidates_get_a_maker_shadow_too_but_unpaid_screens_do_no
         traces = (await s.exec(select(EvaluationTraceRecord))).all()
     assert [sh.llm_should_bet for sh in shadows] == [False]
     assert len(traces) == 2 and traces[1].llm_input_json is None  # no LLM call, nothing to replay
+
+
+async def test_spot_is_calibrated_to_the_settlement_index_from_recorded_strikes(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    raw_vol = agent.feed.volatility(300)
+    async with db.session() as s:
+        price = 82_700.0
+        for i in range(4 * 720):  # four hours of 5-second Coinbase history, ~60% annualized
+            t = T0 - timedelta(hours=4) + timedelta(seconds=5 * i)
+            price *= math.exp(0.00065 * (1 if i % 2 else -1))
+            s.add(BtcPriceHistory(source="coinbase", price=price, timestamp=t))
+        mid = 82_700.0 * (1 + math.exp(-0.00065)) / 2  # Coinbase alternates between two levels
+        for k in range(1, 5):  # settled contracts whose strikes sat $5 above Coinbase
+            s.add(ContractOutcome(ticker=f"KXBTC15M-PAST{k}", strike_price=mid + 5.0,
+                                  close_time=T0 - timedelta(minutes=15 * k), settled_yes=True))
+        await s.commit()
+    await agent.restore()
+
+    assert agent.spot.index_gap == pytest.approx(5.0, abs=0.5)
+    assert agent.spot.long_volatility is not None and agent.spot.long_volatility > raw_vol
+    ctx = agent.spot_context()
+    assert ctx is not None
+    assert ctx.spot_price == pytest.approx(agent.feed.latest_price() + agent.spot.index_gap)
+    assert ctx.historical_volatility == pytest.approx(agent.spot.long_volatility)
+    assert agent.dashboard.pricing["index_gap"] == agent.spot.index_gap
+
+    await agent.sync_markets()
+    assert await agent.write_snapshots() == 1
+    async with db.session() as s:
+        snap = (await s.exec(select(MarketSnapshot))).one()
+    assert snap.index_gap == agent.spot.index_gap
+    assert snap.spot_price == pytest.approx(ctx.spot_price, abs=1e-6)
+
+    context = agent._llm_context(agent.scanner.evaluate(TICKER)[0], 0.0)  # higher vol: the NO side now
+    assert context["contract_close_utc"] == agent.scanner.markets[TICKER].close_time.isoformat()
+    assert "US Eastern" in context["data_notes"]

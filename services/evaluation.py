@@ -505,7 +505,10 @@ def holdout_backtest(
 # ----------------------------------------------------------------------------- job
 
 
-async def build_report(db: Database, now: datetime, *, apply_params: bool, cooldown_hours: float, min_trades: int) -> EvaluationReport:
+async def build_report(
+    db: Database, now: datetime, *, apply_params: bool, cooldown_hours: float, min_trades: int,
+    min_model_contracts: int = 50,
+) -> EvaluationReport:
     since = now - timedelta(days=LOOKBACK_DAYS)
     notes: list[str] = []
     async with db.session() as session:
@@ -523,7 +526,7 @@ async def build_report(db: Database, now: datetime, *, apply_params: bool, coold
                     MarketSnapshot.yes_ask, MarketSnapshot.model_probability, ContractOutcome.settled_yes,
                     MarketSnapshot.spot_model_probability, MarketSnapshot.settlement_model_probability,
                     MarketSnapshot.momentum_1m, MarketSnapshot.historical_volatility,
-                    MarketSnapshot.order_book_imbalance, MarketSnapshot.close_time,
+                    MarketSnapshot.order_book_imbalance, MarketSnapshot.close_time, MarketSnapshot.index_gap,
                 )
                 .join(ContractOutcome, ContractOutcome.ticker == MarketSnapshot.ticker)
                 .where(MarketSnapshot.ts >= since, col(MarketSnapshot.id) % stride == 0)
@@ -582,6 +585,18 @@ async def build_report(db: Database, now: datetime, *, apply_params: bool, coold
         # Compare the two models on the same rows: those recorded after the settlement model existed.
         # Older rows are spot-only (their model_probability was the spot model).
         both = [r for r in snap_rows if r[7] is not None]
+        # Rows priced with the spot calibration (index gap + volatility floor) are a newer model
+        # generation; judge the models on those alone once they are enough evidence by themselves.
+        calibrated = [r for r in both if r[12] is not None]
+        calibrated_contracts = len({r[0] for r in calibrated})
+        if calibrated_contracts >= min_model_contracts:
+            both = calibrated
+            notes.append("Models scored on snapshots priced with the index-gap and volatility corrections only.")
+        elif calibrated:
+            notes.append(
+                f"Index-gap/volatility corrections cover {calibrated_contracts} settled contracts; the model choice "
+                f"uses all snapshots until they reach {min_model_contracts}."
+            )
         rows = both or list(snap_rows)
         model_contracts = len({r[0] for r in rows})
         seconds = np.array([r[1] for r in rows], dtype=float)
@@ -665,6 +680,7 @@ async def run_once(
     replay_model: Optional[str] = None,
     replay_effort: str = "low",
     replay_daily_usd: float = 0.0,
+    min_model_contracts: int = 50,
 ) -> EvaluationReport:
     db = Database(database_url)
     try:
@@ -678,7 +694,8 @@ async def run_once(
             except Exception:
                 logger.exception("LLM replays failed; continuing with the report")
         report = await build_report(
-            db, datetime.now(timezone.utc), apply_params=apply_params, cooldown_hours=cooldown_hours, min_trades=min_trades
+            db, datetime.now(timezone.utc), apply_params=apply_params, cooldown_hours=cooldown_hours, min_trades=min_trades,
+            min_model_contracts=min_model_contracts,
         )
         async with db.session() as session:
             session.add(EvaluationReportRecord(created_at=report.created_at, report_json=report.model_dump_json()))
@@ -702,6 +719,7 @@ def main() -> None:
             replay_model=os.environ.get("LLM_REPLAY_MODEL") if os.environ.get("ANTHROPIC_API_KEY") else None,
             replay_effort=os.environ.get("LLM_REPLAY_EFFORT", "low"),
             replay_daily_usd=float(os.environ.get("LLM_REPLAY_DAILY_USD", "0")),
+            min_model_contracts=int(os.environ.get("MODEL_MIN_CONTRACTS", "50")),
         )
     )
     logger.info("report: %d contracts, %d snapshots; backtest: %s", report.contracts, report.snapshots, report.backtest.status)

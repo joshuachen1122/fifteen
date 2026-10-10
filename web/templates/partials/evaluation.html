@@ -7,6 +7,13 @@
       {% if pricing.blend_weight < 1 %}blended {{ "%.0f" | format(pricing.blend_weight * 100) }}% model / {{ "%.0f" | format(100 - pricing.blend_weight * 100) }}% market{% else %}with no market blend{% endif %}</span>
     <span class="muted">· {{ pricing.reason }} (settings: model={{ pricing.setting_model }}, blend={{ pricing.setting_blend }})</span>
   </div>
+  {% if pricing.blend_weight == 0 %}
+  <div class="muted" style="margin-bottom: 8px;">At 0% model weight the agent's probability equals the market mid, so it finds no edge and does not trade. Snapshots and the hourly evaluation continue; trading resumes once the model earns weight back.</div>
+  {% endif %}
+  {% if pricing.index_gap is defined %}
+  <div class="muted" style="margin-bottom: 8px;">Spot inputs: Coinbase {{ "%+.2f" | format(pricing.index_gap) }} USD measured gap to the CF Benchmarks settlement index
+    · volatility floor {% if pricing.long_volatility %}{{ "%.0f" | format(pricing.long_volatility * 100) }}% ({{ "%.0f" | format(pricing.long_vol_hours) }}h realized){% else %}warming up{% endif %}</div>
+  {% endif %}
   {% endif %}
   {% if not evaluation %}
     <div class="empty">No evaluation yet. The first report runs about an hour after startup, once contracts settle.</div>

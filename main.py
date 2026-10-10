@@ -58,6 +58,7 @@ from execution.order_scanner import KalshiOrderBookScanner, ScanCandidate, SpotC
 from pricing.btc_digital_option import price_digital_option
 from pricing.greeks import MIN_ENTRY_SECONDS, check_entry_guardrail
 from pricing.settlement import SETTLEMENT_WINDOW_SEC, blend_with_market, price_settlement_average
+from services.spot_calibration import CalibratedSpot, estimate_index_gap, gap_observations, realized_volatility
 from services.btc_spot_feed import BtcSpotFeed
 from services.agent_stats import compute_activity, compute_stats
 from services.evaluation import EvaluationReport
@@ -83,6 +84,11 @@ class Settings(BaseSettings):
     # Trading loop
     spot_persist_interval_sec: float = 5.0
     vol_warmup_fraction: float = 0.8  # don't price until spot history covers this share of the vol lookback
+    # Spot calibration (services/spot_calibration.py): shift Coinbase onto the CF Benchmarks index the
+    # contracts settle on, and floor the 5-minute volatility with a longer-horizon estimate.
+    index_gap_correction: bool = True
+    index_gap_contracts: int = 8  # median over this many recent strikes
+    long_vol_lookback_sec: int = 4 * 3600  # 0 disables the volatility floor
     dashboard_refresh_sec: float = 1.0
     stats_refresh_sec: float = 5.0
 
@@ -98,7 +104,7 @@ class Settings(BaseSettings):
     # contracts of evidence; until then the agent trades the spot model without a market blend.
     pricing_model: Literal["auto", "spot", "settlement"] = "auto"
     market_blend: Literal["auto", "off"] = "auto"  # auto: p = w*model + (1-w)*market mid, w fitted hourly
-    model_min_contracts: int = 200
+    model_min_contracts: int = 50
 
     # Experiments (shadow only: nothing here places orders)
     maker_shadow_enabled: bool = True  # record the resting bid we could have posted per LLM-reviewed candidate
@@ -155,7 +161,8 @@ class TradingAgent:
         self.dashboard = dashboard or DashboardState()
         self._clock = clock
 
-        self.state_manager = BtcStateManager(feed, clock=clock)
+        self.spot = CalibratedSpot(feed)  # what the pricing models see
+        self.state_manager = BtcStateManager(self.spot, clock=clock)
         self.scanner = KalshiOrderBookScanner(
             client,
             self.spot_context,
@@ -207,6 +214,7 @@ class TradingAgent:
     async def restore(self) -> None:
         """Rebuild bankroll, open positions, and active parameters after a (re)start."""
         await self.reload_parameters()
+        await self.refresh_spot_calibration()
         if self.fee_type is None:
             try:
                 self.fee_type = (await self.client.get_series(self.scanner.series_ticker)).get("fee_type") or "quadratic"
@@ -411,11 +419,11 @@ class TradingAgent:
         return len(self.feed.buffer) >= self.params.volatility_lookback_sec * self.settings.vol_warmup_fraction
 
     def spot_context(self) -> Optional[SpotContext]:
-        if self.feed.is_stale(self._clock()) or not self.spot_warm():
+        if self.spot.is_stale(self._clock()) or not self.spot_warm():
             return None
-        price = self.feed.latest_price()
-        vol = self.feed.volatility(self.params.volatility_lookback_sec)
-        momentum = self.feed.momentum()
+        price = self.spot.latest_price()
+        vol = self.spot.volatility(self.params.volatility_lookback_sec)
+        momentum = self.spot.momentum()
         if price is None or vol is None or momentum is None or vol <= 0:
             return None
         return SpotContext(spot_price=price, historical_volatility=vol, momentum_1m=momentum)
@@ -423,7 +431,7 @@ class TradingAgent:
     def model_values(self, state: Btc15mMarketState, quote: MarketQuote) -> dict[PricingModel, FairValueOutput]:
         """Both raw pricing models (no market blend) for one contract."""
         elapsed = SETTLEMENT_WINDOW_SEC - state.seconds_remaining
-        observed = self.feed.buffer.snapshot(elapsed - 1) if elapsed > 0 else []
+        observed = self.spot.observed_prices(elapsed - 1) if elapsed > 0 else []
         return {
             "spot": price_digital_option(state, quote, self.params),
             "settlement": price_settlement_average(state, quote, self.params, observed=observed),
@@ -459,8 +467,38 @@ class TradingAgent:
         self.pricing_model, self.blend_weight, self.pricing_reason = model, weight, reason
         self._publish_pricing()
 
+    async def refresh_spot_calibration(self) -> None:
+        """Re-estimate the Coinbase-to-index gap from recent strikes and the long-horizon volatility."""
+        s, now = self.settings, self._clock()
+        lookback = max(s.long_vol_lookback_sec, 0)
+        # Enough history for the volatility window and the minute before each recent window opened.
+        since = now - timedelta(seconds=lookback) - (s.index_gap_contracts + 1) * timedelta(minutes=15) - timedelta(minutes=2)
+        async with self.db.session() as session:
+            history = [
+                (t, p) for t, p in (await session.exec(
+                    select(BtcPriceHistory.timestamp, BtcPriceHistory.price)
+                    .where(BtcPriceHistory.timestamp >= since)
+                    .order_by(col(BtcPriceHistory.timestamp))
+                )).all()
+            ]
+            strikes = {
+                o.ticker: (o.close_time, o.strike_price)
+                for o in (await session.exec(select(ContractOutcome).where(ContractOutcome.close_time >= since))).all()
+            }
+        strikes.update({t: (m.close_time, m.strike_price) for t, m in self.scanner.markets.items()})
+        if s.index_gap_correction:
+            gap = estimate_index_gap(gap_observations(strikes.values(), history), s.index_gap_contracts)
+            if gap is not None:
+                self.spot.index_gap = gap
+        if lookback > 0:
+            self.spot.long_volatility = realized_volatility(history, now, lookback)
+        self._publish_pricing()
+
     def _publish_pricing(self) -> None:
         self.dashboard.pricing = {
+            "index_gap": self.spot.index_gap,
+            "long_volatility": self.spot.long_volatility,
+            "long_vol_hours": self.settings.long_vol_lookback_sec / 3600,
             "model": self.pricing_model,
             "blend_weight": self.blend_weight,
             "reason": self.pricing_reason,
@@ -574,6 +612,7 @@ class TradingAgent:
                     model_probability=fair.model_probability,
                     spot_model_probability=values["spot"].model_probability,
                     settlement_model_probability=values["settlement"].model_probability,
+                    index_gap=self.spot.index_gap,
                 )
 
     # -- decision pipeline -----------------------------------------------------
@@ -746,6 +785,10 @@ class TradingAgent:
             "day_start_equity_usd": self.risk.day_start_equity_cents / 100,
             "open_positions": len(self._positions),
             "utc_time": self._clock().isoformat(),
+            "contract_close_utc": state.expiration_time.isoformat(),
+            "data_notes": "Ticker dates/times are US Eastern (e.g. 26OCT100130 closes 01:30 ET); use "
+            "contract_close_utc. spot_price is Coinbase shifted by the measured gap to the CF Benchmarks "
+            "index the contract settles on. Volatility is the larger of 5-minute and multi-hour realized.",
         }
 
     def _current_ask(self, ticker: str, side: Side) -> Optional[int]:
@@ -987,6 +1030,7 @@ class TradingAgent:
                 logger.exception("settlement poll failed")
 
     async def poll_once(self) -> None:
+        await self.refresh_spot_calibration()
         await self.settle_completed()
         await self.record_contract_outcomes()
         await self.resolve_maker_shadows()
@@ -1075,6 +1119,7 @@ class TradingAgent:
             "AUTO_APPLY_PARAMS": "true" if self.settings.auto_apply_params else "false",
             "AUTO_APPLY_MIN_TRADES": str(self.settings.auto_apply_min_trades),
             "AUTO_APPLY_COOLDOWN_HOURS": str(self.settings.auto_apply_cooldown_hours),
+            "MODEL_MIN_CONTRACTS": str(self.settings.model_min_contracts),
             "LLM_REPLAY_MODEL": self.settings.llm_replay_model,
             "LLM_REPLAY_EFFORT": self.settings.llm_replay_effort,
             "LLM_REPLAY_DAILY_USD": str(self.settings.llm_replay_daily_usd),

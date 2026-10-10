@@ -229,6 +229,9 @@ class MarketSnapshot(SQLModel, table=True):
     # same contracts; null before the settlement-aware model existed (those rows are spot-only).
     spot_model_probability: Optional[float] = None
     settlement_model_probability: Optional[float] = None
+    # Coinbase-to-CF-Benchmarks gap added to spot (services/spot_calibration.py); null before the
+    # correction existed, which also marks the older model generation for the evaluation.
+    index_gap: Optional[float] = None
 
 
 class ContractOutcome(SQLModel, table=True):

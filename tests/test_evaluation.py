@@ -345,3 +345,27 @@ async def test_replays_only_settled_logged_decisions_within_the_daily_budget(db:
         rows = (await s.exec(select(LLMReplayResult))).all()
     assert sorted(r.trace_id for r in rows) == [1, 2] and all(not r.failed for r in rows)
     assert await run_replays(db, model="claude-haiku-5-5", effort="low", daily_budget_usd=0, now=NOW) == 0
+
+
+async def test_models_are_judged_on_calibrated_snapshots_once_they_are_enough_evidence(db: Database) -> None:
+    async with db.session() as s:
+        for i in range(8):
+            ticker, yes, calibrated = f"KXBTC15M-{i}", i % 2 == 0, i >= 4
+            close = NOW - timedelta(minutes=150 - 15 * i)
+            s.add(ContractOutcome(ticker=ticker, strike_price=82_500, close_time=close, settled_yes=yes))
+            # Uncalibrated generation: settlement model better. Calibrated generation: spot model better.
+            good, bad = (0.8, 0.55) if yes else (0.2, 0.45)
+            spot, settle = (good, bad) if calibrated else (bad, good)
+            for k in range(10):
+                s.add(MarketSnapshot(
+                    ts=close - timedelta(seconds=300 - 30 * k), ticker=ticker, strike_price=82_500, close_time=close,
+                    seconds_remaining=300 - 30 * k, yes_bid=48, yes_ask=52, spot_price=82_504, historical_volatility=0.3,
+                    momentum_1m=0.0, order_book_imbalance=0.0, model_probability=spot, spot_model_probability=spot,
+                    settlement_model_probability=settle, index_gap=4.0 if calibrated else None,
+                ))
+        await s.commit()
+    mixed = await build_report(db, NOW, apply_params=False, cooldown_hours=24, min_trades=300, min_model_contracts=5)
+    assert mixed.model_contracts == 8 and "cover 4 settled contracts" in " ".join(mixed.notes)
+    scoped = await build_report(db, NOW, apply_params=False, cooldown_hours=24, min_trades=300, min_model_contracts=4)
+    assert scoped.model_contracts == 4 and scoped.best_model == "spot"
+    assert any("corrections only" in n for n in scoped.notes)
