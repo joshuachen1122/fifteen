@@ -27,7 +27,7 @@ import os
 import signal
 import sys
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Coroutine, Iterator
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Literal, Optional
 
@@ -65,7 +65,13 @@ from services.evaluation import EvaluationReport
 from services.llm_evaluator import LLMEvaluator, LLMUsage
 from services.maker_experiment import first_fill, maker_limit, side_quotes
 from services.optimizer import load_active_parameters
-from services.risk_engine import Position, RiskEngine, kalshi_maker_fee_cents, kalshi_taker_fee_cents
+from services.risk_engine import (
+    DAILY_DRAWDOWN_LIMIT,
+    Position,
+    RiskEngine,
+    kalshi_maker_fee_cents,
+    kalshi_taker_fee_cents,
+)
 from web.app import DashboardState, create_app
 
 logger = logging.getLogger("btc15m")
@@ -98,7 +104,15 @@ class Settings(BaseSettings):
     llm_reask_edge_step: float = 0.02  # after a veto, re-ask only once the edge improves this much
     llm_min_seconds_remaining: int = 60  # too little time left to act on a verdict
     max_plausible_edge: float = 0.30  # larger "edges" are almost always bad quotes, not mispricing
-    llm_daily_budget_usd: float = 5.0  # hard cap; past it the agent fails closed (no LLM, no trades)
+    llm_daily_budget_usd: float = 5.0  # hard cap; past it no LLM calls (and no trades when the LLM gates them)
+
+    # Entries. Replays of the recorded snapshots found the model loses to the market until the
+    # 60-second settlement average starts and beats it afterwards, so only enter in that final stretch.
+    entry_max_seconds_remaining: int = 60  # 900 trades the whole window
+    # True: the LLM must approve each trade. False: trade on the model alone and ask the LLM afterwards
+    # in shadow, so its verdicts are still scored without adding seconds of latency to late entries.
+    llm_gate: bool = False
+    model_only_cooldown_sec: float = 5.0  # re-evaluation gap per ticker/side when no LLM call gates it
 
     # Pricing. "auto" follows the hourly evaluation once it has `model_min_contracts` settled
     # contracts of evidence; until then the agent trades the spot model without a market blend.
@@ -184,6 +198,7 @@ class TradingAgent:
         self._llm_calls: Counter[str] = Counter()  # per ticker
         self._llm_spend_day: Optional[date] = None
         self._llm_spend_today_usd = 0.0
+        self._halt_logged_day: Optional[date] = None
         self.llm_screened: Counter[str] = Counter()  # candidates rejected before a paid call, by reason
         self._initial_bankroll_cents = 0
         self.max_trade_cents = round(settings.max_trade_usd * 100)
@@ -270,9 +285,11 @@ class TradingAgent:
         # them; a live Kalshi balance already reflects settlements but excludes open positions.
         starting = balance + settled_pnl if self.client.is_paper else balance + open_cost
         self._initial_bankroll_cents = starting - settled_pnl
-        # Spend caps protect real money only; paper keeps unrestricted Kelly sizing.
+        # Spend caps and the drawdown kill switch protect real money only; paper keeps trading with
+        # unrestricted Kelly sizing because its job is to collect evidence.
         self.risk = RiskEngine(
             starting,
+            daily_drawdown_limit=None if self.client.is_paper else DAILY_DRAWDOWN_LIMIT,
             now=now,
             max_order_cost_cents=None if self.client.is_paper else self.max_trade_cents,
             daily_spend_limit_cents=None if self.client.is_paper else self.max_daily_cents,
@@ -440,10 +457,16 @@ class TradingAgent:
 
     def fair_value(self, state: Btc15mMarketState, quote: MarketQuote) -> FairValueOutput:
         """The probability the agent trades on: the active model, shrunk toward the market mid."""
-        return self._active_fair_value(self.model_values(state, quote), quote)
+        return self._active_fair_value(self.model_values(state, quote), quote, state.seconds_remaining)
 
-    def _active_fair_value(self, values: dict[PricingModel, FairValueOutput], quote: MarketQuote) -> FairValueOutput:
-        return blend_with_market(values[self.pricing_model], quote, self.effective_blend_weight)
+    def _active_fair_value(
+        self, values: dict[PricingModel, FairValueOutput], quote: MarketQuote, seconds_remaining: int
+    ) -> FairValueOutput:
+        model = self.pricing_model
+        if self.settings.pricing_model == "auto" and seconds_remaining <= SETTLEMENT_WINDOW_SEC:
+            # Part of the settlement average is already known; only the settlement model uses it.
+            model = "settlement"
+        return blend_with_market(values[model], quote, self.effective_blend_weight)
 
     @property
     def effective_blend_weight(self) -> float:
@@ -510,6 +533,8 @@ class TradingAgent:
             "model": self.pricing_model,
             "blend_weight": self.blend_weight,
             "paper_market_blend": self.settings.paper_market_blend,
+            "entry_max_seconds": self.settings.entry_max_seconds_remaining,
+            "llm_gate": self.settings.llm_gate,
             "reason": self.pricing_reason,
             "setting_model": self.settings.pricing_model,
             "setting_blend": self.settings.market_blend,
@@ -604,7 +629,7 @@ class TradingAgent:
             state = await self.state_manager.get_market_state(ticker)
             if state is not None and self.spot_warm():
                 values = self.model_values(state, quote)
-                fair = self._active_fair_value(values, quote)
+                fair = self._active_fair_value(values, quote, state.seconds_remaining)
                 self.dashboard.update_market(state, fair, quote)
                 self._snapshots[ticker] = MarketSnapshot(
                     ts=self._clock(),
@@ -631,16 +656,22 @@ class TradingAgent:
         # Candidates are consumed here, not via the scanner's queue; keep it from filling up.
         with contextlib.suppress(asyncio.QueueEmpty):
             self.scanner.candidates.get_nowait()
-        task = asyncio.create_task(self.handle_candidate(candidate), name=f"candidate-{candidate.ticker}")
+        self._spawn(self.handle_candidate(candidate), f"candidate-{candidate.ticker}")
+
+    def _spawn(self, coro: Coroutine[Any, Any, None], name: str) -> None:
+        task = asyncio.create_task(coro, name=name)
         self._handlers.add(task)
         task.add_done_callback(self._handlers.discard)
 
     async def handle_candidate(self, candidate: ScanCandidate) -> None:
-        ticker, now = candidate.ticker, self._clock()
+        ticker, now, s = candidate.ticker, self._clock(), self.settings
+        if candidate.market_state.seconds_remaining > s.entry_max_seconds_remaining:
+            return
         if ticker in self._inflight or self._has_position(ticker):
             return
+        cooldown = s.llm_cooldown_sec if s.llm_gate else s.model_only_cooldown_sec
         last = self._last_evaluated.get((ticker, candidate.side))
-        if last is not None and (now - last).total_seconds() < self.settings.llm_cooldown_sec:
+        if last is not None and (now - last).total_seconds() < cooldown:
             return
         self._inflight.add(ticker)
         try:
@@ -658,17 +689,25 @@ class TradingAgent:
             logger.debug("%s: %s", c.ticker, guard.reason)
             return
         if self.risk.is_trading_halted(now):
-            logger.warning("daily drawdown kill switch active; ignoring %s %s", c.ticker, c.side)
+            if self._halt_logged_day != now.date():
+                self._halt_logged_day = now.date()
+                logger.warning("daily drawdown kill switch active: no new trades until 00:00 UTC")
             return
 
-        screen = self._llm_screen(c, now)
-        if screen is not None:
-            self.llm_screened[screen] += 1
-            return
+        gated = self.settings.llm_gate
+        if gated:
+            screen = self._llm_screen(c, now)
+            if screen is not None:
+                self.llm_screened[screen] += 1
+                return
 
         self._last_evaluated[(c.ticker, c.side)] = now
         context = self._llm_context(c, guard.greeks.delta)
-        verdict, usage = await self._llm_verdict(c, context)
+        usage: Optional[LLMUsage] = None
+        if gated:
+            verdict, usage = await self._llm_verdict(c, context)
+        else:
+            verdict = _model_verdict(c)
         if usage is not None:
             self._llm_calls[c.ticker] += 1
             self._add_llm_spend(usage.cost_usd, now)
@@ -713,10 +752,43 @@ class TradingAgent:
                         skip_reason = "order_not_filled"
 
         llm_input = json.dumps({"candidate": c.fair_value.model_dump(mode="json"), "context": context}, default=str)
-        evaluation_id = await self._record_evaluation(c, verdict, usage, skip_reason, llm_input if usage else None)
+        if gated:
+            evaluation_id = await self._record_evaluation(c, verdict, usage, skip_reason, llm_input if usage else None)
+        else:
+            evaluation_id = await self._record_evaluation(c, None, None, skip_reason, llm_input)
         await self._record_trade(c, evaluation_id, ask, order, result, position, now)
         if usage is not None and self.settings.maker_shadow_enabled:
             await self._record_maker_shadow(c, evaluation_id, verdict, p_win)
+        if not gated:
+            self._spawn(self._shadow_llm(evaluation_id, c, context), f"shadow-llm-{c.ticker}")
+
+    async def _shadow_llm(self, evaluation_id: int, c: ScanCandidate, context: dict[str, Any]) -> None:
+        """Ask the LLM about a decision already made on the model alone and record its verdict.
+
+        The verdict is scored by the hourly evaluation (and replayed through the cheaper model) but
+        never acted on. Spend limits still apply.
+        """
+        s, now = self.settings, self._clock()
+        if self.evaluator is None or self._llm_calls[c.ticker] >= s.llm_max_calls_per_market:
+            return
+        if self.llm_spend_today(now) >= s.llm_daily_budget_usd:
+            return
+        self._llm_calls[c.ticker] += 1
+        try:
+            verdict, usage = await self.evaluator.evaluate_with_usage(c.fair_value, context)
+        except Exception:
+            logger.exception("shadow LLM call failed for %s %s", c.ticker, c.side)
+            return
+        if usage is None:
+            return  # API error: a fail-closed veto says nothing about the LLM's judgement
+        self._add_llm_spend(usage.cost_usd, self._clock())
+        async with self.db.session() as session:
+            row = await session.get(EvaluationTraceRecord, evaluation_id)
+            if row is None:
+                return
+            _apply_verdict(row, verdict, usage)
+            session.add(row)
+            await session.commit()
 
     def _llm_screen(self, c: ScanCandidate, now: datetime) -> Optional[str]:
         """Free checks that decide whether a candidate is worth a paid LLM call. Returns the reason to skip."""
@@ -855,7 +927,7 @@ class TradingAgent:
     async def _record_evaluation(
         self,
         c: ScanCandidate,
-        verdict: LLMVerdict,
+        verdict: Optional[LLMVerdict],  # None: decided on the model alone (LLM in shadow)
         usage: Optional[LLMUsage],
         skip_reason: Optional[str],
         llm_input: Optional[str] = None,
@@ -881,21 +953,13 @@ class TradingAgent:
             gross_edge=c.edge,
             volatility_used=fv.volatility_used,
             d2_score=fv.d2_score,
-            llm_should_bet=verdict.should_bet,
-            llm_adjusted_probability=verdict.adjusted_probability,
-            llm_confidence_score=verdict.confidence_score,
-            llm_reasoning=verdict.reasoning,
-            llm_risk_signals=verdict.risk_signals,
-            llm_model=usage.model if usage else None,
-            llm_input_tokens=usage.input_tokens if usage else None,
-            llm_output_tokens=usage.output_tokens if usage else None,
-            llm_cache_read_tokens=usage.cache_read_tokens if usage else None,
-            llm_cache_write_tokens=usage.cache_write_tokens if usage else None,
-            llm_cost_usd=usage.cost_usd if usage else None,
             llm_input_json=llm_input,
+            llm_gated=None if verdict is not None else False,
             decision="skip" if skip_reason else "trade",
             skip_reason=skip_reason,
         )
+        if verdict is not None:
+            _apply_verdict(record, verdict, usage)
         async with self.db.session() as session:
             session.add(record)
             await session.commit()
@@ -1253,6 +1317,31 @@ class TradingAgent:
         for task in list(self._handlers):
             task.cancel()
         await asyncio.gather(*self._handlers, return_exceptions=True)
+
+
+def _model_verdict(c: ScanCandidate) -> LLMVerdict:
+    """Stand-in verdict for a decision made on the model alone (LLM gate off)."""
+    return LLMVerdict(
+        should_bet=True,
+        adjusted_probability=min(max(c.fair_value.model_probability, 0.01), 0.99),
+        confidence_score=0.0,
+        reasoning="Model-only entry in the settlement window (LLM gate off).",
+        risk_signals=[],
+    )
+
+
+def _apply_verdict(row: EvaluationTraceRecord, verdict: LLMVerdict, usage: Optional[LLMUsage]) -> None:
+    row.llm_should_bet = verdict.should_bet
+    row.llm_adjusted_probability = verdict.adjusted_probability
+    row.llm_confidence_score = verdict.confidence_score
+    row.llm_reasoning = verdict.reasoning
+    row.llm_risk_signals = verdict.risk_signals
+    row.llm_model = usage.model if usage else None
+    row.llm_input_tokens = usage.input_tokens if usage else None
+    row.llm_output_tokens = usage.output_tokens if usage else None
+    row.llm_cache_read_tokens = usage.cache_read_tokens if usage else None
+    row.llm_cache_write_tokens = usage.cache_write_tokens if usage else None
+    row.llm_cost_usd = usage.cost_usd if usage else None
 
 
 def _fill_price(row: TradeRecord) -> int:

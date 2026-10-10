@@ -159,6 +159,13 @@ def test_drawdown_just_under_limit_keeps_trading():
     assert not risk.is_trading_halted(T0)
 
 
+def test_no_drawdown_limit_never_halts():
+    risk = RiskEngine(starting_bankroll_cents=10_000, daily_drawdown_limit=None, now=T0)
+    order = OrderRequest(ticker="X", side="yes", count=90, max_cost_cents=0, kelly_fraction=0.1, reasoning="")
+    risk.settle_position(risk.open_position(order, 90, now=T0), settled_yes=False, now=T0)
+    assert risk.equity_cents < 2_000 and not risk.is_trading_halted(T0)
+
+
 # ---------------------------------------------------------------- pricing + backtester
 
 

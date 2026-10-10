@@ -111,6 +111,9 @@ class EvaluationTraceRecord(SQLModel, table=True):
     is_paper: Optional[bool] = Field(default=None, index=True)  # mode at decision time; null = before modes
 
     # Final decision
+    # False: decided on the model alone, with the LLM verdict recorded afterwards in shadow (it gated
+    # nothing). Null = the LLM gated the decision (all rows before shadow mode).
+    llm_gated: Optional[bool] = None
     decision: str = Field(index=True)  # "trade" | "skip"
     skip_reason: Optional[str] = None
     strategy_parameters_id: Optional[int] = Field(default=None, foreign_key="strategy_parameters.id")

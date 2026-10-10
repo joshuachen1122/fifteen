@@ -214,6 +214,7 @@ class Decision(BaseModel):
     llm_probability: Optional[float]  # P(YES)
     confidence: Optional[float]
     approved: Optional[bool]
+    llm_gated: bool = True  # False: the LLM verdict is a shadow that decided nothing
     decision: str  # "trade" | "skip"
     skip_reason: Optional[str]
     reasoning: Optional[str]
@@ -319,6 +320,7 @@ async def compute_activity(
             llm_probability=r.llm_adjusted_probability,
             confidence=r.llm_confidence_score,
             approved=r.llm_should_bet,
+            llm_gated=r.llm_gated is not False,
             decision=r.decision,
             skip_reason=r.skip_reason,
             reasoning=r.llm_reasoning,

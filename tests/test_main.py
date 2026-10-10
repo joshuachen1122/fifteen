@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from datetime import datetime, timedelta, timezone
@@ -114,12 +115,19 @@ def advance(agent: TradingAgent, clock: Clock, delta: timedelta) -> None:
         agent.feed.buffer.add_tick(BtcSpotTick(source="coinbase", price=82_700.0, timestamp=clock.now))
 
 
-def make_agent(db: Database, clock: Clock, evaluator: Any, **settings: Any) -> TradingAgent:
+# Most tests exercise the LLM-gated pipeline over the whole window; the settlement-window defaults
+# (model-only entries in the last minute, LLM in shadow) have their own tests.
+GATED = {"llm_gate": True, "entry_max_seconds_remaining": 900}
+
+
+def make_agent(
+    db: Database, clock: Clock, evaluator: Any, close_in: timedelta = timedelta(minutes=10), **settings: Any
+) -> TradingAgent:
     client = SettlingClient()
     agent = TradingAgent(
-        Settings(web_enabled=False, **settings), db=db, client=client, feed=warm_feed(clock), evaluator=evaluator, clock=clock
+        Settings(web_enabled=False, **(GATED | settings)), db=db, client=client, feed=warm_feed(clock), evaluator=evaluator, clock=clock
     )
-    market = KalshiMarket(ticker=TICKER, strike_price=STRIKE, close_time=clock.now + timedelta(minutes=10))
+    market = KalshiMarket(ticker=TICKER, strike_price=STRIKE, close_time=clock.now + close_in)
     book = OrderBook(TICKER)
     book.apply_snapshot({"yes": [[YES_BID, 100]], "no": [[100 - YES_ASK, 120]]}, clock.now)
     agent.scanner.markets = {TICKER: market}
@@ -172,6 +180,69 @@ async def test_candidate_flows_through_llm_and_fee_aware_kelly_to_paper_fill(db:
     advance(agent, clock, timedelta(minutes=2))
     await agent.handle_candidate(yes_candidate(agent))
     assert len(agent.evaluator.calls) == 1  # type: ignore[union-attr]
+
+
+SETTLEMENT_WINDOW = {"llm_gate": False, "entry_max_seconds_remaining": 60}  # the production defaults
+
+
+async def test_defaults_ignore_candidates_before_the_settlement_window(db: Database) -> None:
+    assert {k: getattr(Settings(), k) for k in SETTLEMENT_WINDOW} == SETTLEMENT_WINDOW
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator(), **SETTLEMENT_WINDOW)  # 10 minutes left
+    await agent.restore()
+
+    await agent.handle_candidate(yes_candidate(agent))
+
+    assert await trade_rows(db) == [] and agent.evaluator.calls == []  # type: ignore[union-attr]
+
+
+async def test_settlement_window_trades_on_the_model_and_asks_the_llm_in_shadow(db: Database) -> None:
+    clock = Clock(T0)
+    vetoing = FakeEvaluator(should_bet=False)
+    agent = make_agent(db, clock, vetoing, close_in=timedelta(seconds=45), **SETTLEMENT_WINDOW)
+    await agent.restore()
+    agent.pricing_model = "spot"  # inside the averaging window the settlement model is used regardless
+    candidate = yes_candidate(agent)
+    settlement = agent.model_values(candidate.market_state, candidate.quote)["settlement"]
+    assert candidate.fair_value.model_probability == settlement.model_probability
+
+    await agent.handle_candidate(candidate)
+
+    [row] = await trade_rows(db)  # the LLM's veto gated nothing
+    assert (row.side, row.status) == ("yes", "filled") and row.filled_count > 0
+    async with db.session() as s:
+        trace = (await s.exec(select(EvaluationTraceRecord))).one()
+    assert trace.decision == "trade" and trace.llm_gated is False and trace.llm_input_json
+
+    await asyncio.gather(*agent._handlers)  # the shadow call runs after the order
+    async with db.session() as s:
+        trace = (await s.exec(select(EvaluationTraceRecord))).one()
+    assert len(vetoing.calls) == 1
+    assert trace.llm_should_bet is False and trace.llm_risk_signals == ["Macro news window"]
+    assert trace.llm_cost_usd == CALL_USAGE.cost_usd and trace.decision == "trade"
+    assert agent.llm_spend_today(clock.now) == pytest.approx(CALL_USAGE.cost_usd)
+
+    import httpx
+
+    from web.app import create_app
+
+    await agent.refresh_stats()
+    app = create_app(agent.dashboard, db.engine)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http:
+        activity = (await http.get("/partials/activity")).text
+        evaluation = (await http.get("/partials/evaluation")).text
+    assert "✓ traded" in activity and "LLM shadow: would veto" in activity and "✕ vetoed" not in activity
+    assert "final 60s only" in evaluation and "LLM in shadow" in evaluation
+
+
+async def test_paper_ignores_the_drawdown_kill_switch(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.restore()
+    assert agent.risk is not None and agent.risk.daily_drawdown_limit is None
+    agent.risk.cash_cents //= 2  # a 50% day
+    agent.risk._check_drawdown()
+    assert not agent.risk.is_trading_halted(clock.now)
 
 
 async def test_llm_veto_records_observation_without_trading(db: Database) -> None:

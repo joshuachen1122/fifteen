@@ -12,6 +12,10 @@
   {% if pricing.blend_weight == 0 %}
   <div class="muted" style="margin-bottom: 8px;">At 0% model weight the live probability equals the market mid, so live trading finds no edge and places no orders until the model earns weight back.{% if not pricing.paper_market_blend %} Paper keeps trading the raw model so the experiments keep collecting data.{% endif %}</div>
   {% endif %}
+  {% if pricing.entry_max_seconds is defined %}
+  <div class="muted" style="margin-bottom: 8px;">Entries: {% if pricing.entry_max_seconds >= 900 %}whole window{% else %}final {{ pricing.entry_max_seconds }}s only (inside the settlement average, priced with the settlement model){% endif %}
+    · LLM {% if pricing.llm_gate %}must approve each trade{% else %}in shadow: trades go on the model alone and the LLM's verdict is recorded afterwards for scoring{% endif %}</div>
+  {% endif %}
   {% if pricing.index_gap is defined %}
   <div class="muted" style="margin-bottom: 8px;">Spot inputs: Coinbase {{ "%+.2f" | format(pricing.index_gap) }} USD measured gap to the CF Benchmarks settlement index
     · volatility floor {% if pricing.long_volatility %}{{ "%.0f" | format(pricing.long_volatility * 100) }}% ({{ "%.0f" | format(pricing.long_vol_hours) }}h realized){% else %}warming up{% endif %}</div>

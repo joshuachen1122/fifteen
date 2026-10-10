@@ -75,7 +75,7 @@ class RiskEngine:
     def __init__(
         self,
         starting_bankroll_cents: int,
-        daily_drawdown_limit: float = DAILY_DRAWDOWN_LIMIT,
+        daily_drawdown_limit: Optional[float] = DAILY_DRAWDOWN_LIMIT,  # None: never halt (paper)
         now: Optional[datetime] = None,
         max_order_cost_cents: Optional[int] = None,
         daily_spend_limit_cents: Optional[int] = None,
@@ -204,6 +204,8 @@ class RiskEngine:
             self.spent_today_cents = 0
 
     def _check_drawdown(self) -> None:
+        if self.daily_drawdown_limit is None:
+            return
         floor = self._day_start_equity_cents * (1 - self.daily_drawdown_limit)
         if self.equity_cents <= floor:
             self._halted = True

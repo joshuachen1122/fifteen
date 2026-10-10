@@ -83,12 +83,15 @@
         <td>{{ prob(d.llm_probability) }}</td>
         <td>{{ prob(d.confidence) }}</td>
         <td>
-          {% if d.decision == "trade" %}<span class="pill good">✓ traded</span>
+          {% if not d.llm_gated %}
+            {% if d.decision == "trade" %}<span class="pill good">✓ traded</span>{% else %}<span class="pill warning">not traded</span>{% endif %}
+            <div class="muted">LLM shadow: {% if d.approved is none %}pending{% elif d.approved %}would bet{% else %}would veto{% endif %}</div>
+          {% elif d.decision == "trade" %}<span class="pill good">✓ traded</span>
           {% elif d.approved %}<span class="pill warning">approved · not traded</span>
           {% else %}<span class="pill critical">✕ vetoed</span>{% endif %}
         </td>
         <td class="reason">
-          {% if d.decision == "skip" and d.approved and d.skip_reason %}<div>{{ d.skip_reason | replace("_", " ") }}</div>{% endif %}
+          {% if d.decision == "skip" and (d.approved or not d.llm_gated) and d.skip_reason %}<div>{{ d.skip_reason | replace("_", " ") }}</div>{% endif %}
           {% set signals %}{% if d.risk_signals %}<div class="signals">{% for sig in d.risk_signals %}<span class="pill warning">{{ sig }}</span>{% endfor %}</div>{% endif %}{% endset %}
           {% if d.reasoning %}
           <details><summary>{{ d.reasoning[:110] }}{% if d.reasoning | length > 110 %}…{% endif %}</summary>{{ d.reasoning }}<div class="signals-in-details">{{ signals }}</div></details>
