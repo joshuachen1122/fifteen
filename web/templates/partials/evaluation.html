@@ -149,20 +149,6 @@
   </table></div>
   {% else %}<div class="muted">No replays yet: decisions are re-asked once their contract settles (daily budget applies).</div>{% endif %}
 
-  <div class="subhead">Held-out backtest (tune on older 70%, test on newest 30%)</div>
-  {% set b = e.backtest %}
-  <div class="{{ 'delta-up' if b.applied else 'muted' }}">{{ b.status }}</div>
-  {% if b.current %}
-  <div class="table-wrap"><table style="margin-top: 6px;">
-    <thead><tr><th>On held-out trades</th><th>Trades</th><th>Net PnL</th><th>Sharpe</th><th>Win rate</th><th>Min edge</th><th>Vol lookback</th><th>Momentum wt</th></tr></thead>
-    <tbody>
-      {% for label, r in [("Active parameters", b.current), ("Best tuned", b.best)] if r %}
-      <tr><td>{{ label }}</td><td>{{ r.trades }}</td><td>${{ "{:,.2f}".format(r.total_net_pnl) }}</td><td>{{ "%.2f" | format(r.sharpe_ratio) }}</td>
-        <td>{{ "%.1f" | format(r.win_rate * 100) }}%</td><td>{{ "%.1f" | format(r.params.min_gross_edge * 100) }}%</td>
-        <td>{{ r.params.volatility_lookback_sec }}s</td><td>{{ "%.2f" | format(r.params.momentum_weight) }}</td></tr>
-      {% endfor %}
-    </tbody>
-  </table></div>
-  {% endif %}
+  <div class="muted" style="margin-top: 14px;">Parameter tuning results are in the “Parameter tuning” panel.</div>
   {% endif %}
 </section>

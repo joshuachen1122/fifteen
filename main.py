@@ -64,7 +64,7 @@ from services.agent_stats import compute_activity, compute_stats
 from services.evaluation import EvaluationReport
 from services.llm_evaluator import LLMEvaluator, LLMUsage
 from services.maker_experiment import first_fill, maker_limit, side_quotes
-from services.optimizer import Optimizer, load_active_parameters
+from services.optimizer import load_active_parameters
 from services.risk_engine import Position, RiskEngine, kalshi_maker_fee_cents, kalshi_taker_fee_cents
 from web.app import DashboardState, create_app
 
@@ -130,7 +130,6 @@ class Settings(BaseSettings):
     auto_apply_params: bool = True  # apply tuned parameters only when they win on held-out trades
     auto_apply_min_trades: int = 300
     auto_apply_cooldown_hours: float = 24.0
-    optimizer_min_trades: int = 30  # manual "Optimize Parameters" button on the dashboard
 
     # Dashboard / health checks
     web_enabled: bool = True
@@ -193,7 +192,6 @@ class TradingAgent:
         self._inflight: set[str] = set()
         self._handlers: set[asyncio.Task[None]] = set()
         self._order_lock = asyncio.Lock()  # sizing must see the bankroll left by the previous fill
-        self._optimizer_lock = asyncio.Lock()
 
         self._latest_tick: Optional[BtcSpotTick] = None
         self._last_dashboard_tick: Optional[datetime] = None
@@ -1235,29 +1233,6 @@ class TradingAgent:
             )
         return settled_positions
 
-    def make_optimizer(self, engine: AsyncEngine) -> Optimizer:
-        return Optimizer(
-            engine,
-            base_params=self.params,
-            min_trades=self.settings.optimizer_min_trades,
-            starting_bankroll_cents=self.risk.equity_cents if self.risk else 100_000,
-        )
-
-    async def run_optimizer(self, reason: str) -> None:
-        if self._optimizer_lock.locked() or self.dashboard.optimizer_status == "running":
-            return
-        async with self._optimizer_lock:
-            logger.info("running optimizer (%s)", reason)
-            self.dashboard.optimizer_status = "running"
-            try:
-                result = await self.make_optimizer(self.engine).run()
-            except Exception as exc:
-                logger.exception("optimizer failed")
-                self.dashboard.optimizer_status, self.dashboard.optimizer_error = "error", str(exc)
-                return
-            self.dashboard.last_optimization, self.dashboard.optimizer_status = result, "done"
-            logger.info("optimizer: %s", result.message)
-
     # -- lifecycle -------------------------------------------------------------
 
     def tasks(self) -> list[asyncio.Task[None]]:
@@ -1329,7 +1304,6 @@ async def run(settings: Settings) -> None:
         app = create_app(
             agent.dashboard,
             db.engine,
-            optimizer_factory=agent.make_optimizer,
             controls=agent,
             password=settings.dashboard_password,
         )

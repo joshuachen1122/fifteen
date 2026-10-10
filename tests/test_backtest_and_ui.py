@@ -1,5 +1,4 @@
 import math
-import time
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from types import SimpleNamespace
@@ -18,6 +17,7 @@ from core.schemas import Btc15mMarketState, BtcSpotTick, FairValueOutput, LLMVer
 from db.models import BtcPriceHistory, StrategyParametersRecord, TradeRecord
 from db.session import init_db
 from services.backtester import SECONDS_PER_YEAR, Backtester, digital_option_probability
+from services.evaluation import EvaluationReport, HoldoutBacktest, StrategySummary
 from services.llm_evaluator import LLMEvaluator, LLMUsage, evaluate_btc_trade
 from services.optimizer import Optimizer, ParameterGrid, load_active_parameters
 from services.risk_engine import RiskEngine, kalshi_taker_fee_cents, kelly_fraction
@@ -382,13 +382,7 @@ def dashboard(tmp_path):
     expired_state, expired_fv, _ = make_market(now, strike=81_000, minutes_left=-1)
     state.update_market(expired_state, expired_fv)
 
-    ticks, trades = synthetic_history()
-
-    class SeededOptimizer(Optimizer):
-        async def run(self, ticks_=None, trades_=None, save=True):
-            return await super().run(ticks=ticks, trades=trades, save=save)
-
-    app = create_app(state, engine, optimizer_factory=lambda e: SeededOptimizer(e, grid=SMALL_GRID, min_trades=5))
+    app = create_app(state, engine)
     with TestClient(app) as client:
         yield client, state
 
@@ -399,8 +393,8 @@ def test_index_renders_dark_htmx_dashboard(dashboard):
     assert 'data-theme="dark"' in html and "htmx.org" in html
     assert "Live BTC spot vs strike K" in html
     assert "Active 15m options" in html and "N(d₂)" in html
-    assert "Backtest performance" in html
-    assert 'hx-post="/optimize"' in html and "Optimize Parameters" in html
+    assert "Parameter tuning" in html and "hourly held-out backtest" in html
+    assert "/optimize" not in html and "Optimize Parameters" not in html
 
 
 def test_spot_partial_shows_spot_vs_strike(dashboard):
@@ -423,25 +417,24 @@ def test_markets_partial_lists_only_active_options_with_probabilities(dashboard)
     assert "▲ Edge" in html                         # 6.4% edge >= default 3.5%
 
 
-def test_optimize_button_runs_backtest_sub_agent(dashboard):
-    client, _ = dashboard
-    started = client.post("/optimize").text
-    assert "Optimizing…" in started and 'hx-trigger="every 1s"' in started
+def test_tuning_panel_shows_the_hourly_held_out_backtest(dashboard):
+    client, state = dashboard
+    assert client.post("/optimize").status_code in (404, 405)  # tuning is automatic now
+    assert "No evaluation yet" in client.get("/partials/backtest").text
 
-    deadline = time.monotonic() + 60
-    html = started
-    while "Optimizing…" in html and time.monotonic() < deadline:
-        time.sleep(0.05)
-        html = client.get("/partials/backtest").text
-    assert "Optimizing…" not in html, "optimizer did not finish in time"
-    assert "Sharpe (ann.)" in html and "Win rate" in html and "Net PnL" in html
-    assert 'id="equity-chart"' in html
-    assert "Top" in html and "parameter sets" in html
-
-    params = client.get("/api/parameters").json()
-    assert params["min_gross_edge"] in SMALL_GRID.min_gross_edge
-    assert params["volatility_lookback_sec"] in SMALL_GRID.volatility_lookback_sec
-
+    current = StrategySummary(params=StrategyParameters(), trades=40, total_net_pnl=-3.5, sharpe_ratio=-0.4, win_rate=0.45)
+    best = StrategySummary(params=StrategyParameters(min_gross_edge=0.05), trades=31, total_net_pnl=12.25, sharpe_ratio=1.1, win_rate=0.55)
+    state.evaluation = EvaluationReport(
+        created_at=datetime(2026, 10, 10, 6, 0, tzinfo=timezone.utc), contracts=0, snapshots=0, scores=[], best_blend_weight=None,
+        calibration=[], horizons=[], edges=[], llm=None, notes=[],
+        backtest=HoldoutBacktest(status="better parameters found; last change < 24h ago, waiting", train_trades=210,
+                                 test_trades=90, current=current, best=best),
+    )
+    html = client.get("/partials/backtest").text
+    assert "better parameters found" in html and "2026-10-10 06:00 UTC" in html
+    assert "oldest 210 replayable trades" in html and "newest 90" in html
+    assert "Active parameters" in html and "Best tuned" in html and "+12.25" in html and "5.0%" in html
+    assert 'hx-trigger="every 60s"' in html
 
 async def test_evaluator_reports_usage_and_cost():
     usage = SimpleNamespace(

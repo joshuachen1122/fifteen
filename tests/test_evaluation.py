@@ -178,9 +178,12 @@ async def test_evaluation_panel_renders_a_full_report(db: Database) -> None:
     app = create_app(state, db.engine)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as http:
         page = await http.get("/partials/evaluation")
+        tuning = await http.get("/partials/backtest")
     assert page.status_code == 200
-    for text in ("Spot model", "Market (mid price)", "best", "PAPER", "LIVE", "Vetoed", "Active parameters", "Best tuned"):
+    for text in ("Spot model", "Market (mid price)", "best", "PAPER", "LIVE", "Vetoed"):
         assert text in page.text, text
+    for text in ("Active parameters", "Best tuned"):  # held-out tuning lives in its own panel
+        assert text in tuning.text, text
 
 
 # ---------------------------------------------------------------- model choice, learned model, experiments

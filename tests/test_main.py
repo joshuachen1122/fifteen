@@ -827,7 +827,9 @@ async def test_hourly_evaluation_runs_in_a_subprocess_and_reaches_the_dashboard(
         app = create_app(agent.dashboard, database.engine)
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as http:
             page = await http.get("/partials/evaluation")
-        assert page.status_code == 200 and "Held-out backtest" in page.text and "waiting for data" in page.text
+            tuning = await http.get("/partials/backtest")
+        assert tuning.status_code == 200 and "hourly held-out backtest" in tuning.text and "waiting for data" in tuning.text
+        assert page.status_code == 200
         assert "Trading on: <strong>spot model</strong>" in page.text and "Resting-order experiment" in page.text
     finally:
         await database.dispose()

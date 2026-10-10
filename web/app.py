@@ -1,10 +1,9 @@
-"""Dark-mode HTMX dashboard: live spot vs strike, active 15m options, backtests.
+"""Dark-mode HTMX dashboard: live spot vs strike, active 15m options, evaluation results.
 
 Run with: uvicorn web.app:app --reload
 The live trader pushes data in through `DashboardState.update_spot` / `update_market`.
 """
 
-import asyncio
 import base64
 import binascii
 import logging
@@ -13,7 +12,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional, Protocol
+from typing import Any, Optional, Protocol
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request
@@ -26,8 +25,8 @@ from core.schemas import Btc15mMarketState, BtcSpotTick, FairValueOutput, Market
 from db.session import init_db, make_engine
 from services.agent_stats import AgentActivity, AgentStats
 from services.evaluation import EvaluationReport
-from services.optimizer import OptimizationResult, Optimizer, load_active_parameters
-from web.charts import ReferenceLine, line_chart_svg, usd, usd_cents
+from services.optimizer import load_active_parameters
+from web.charts import ReferenceLine, line_chart_svg, usd
 
 logger = logging.getLogger(__name__)
 
@@ -69,10 +68,6 @@ class DashboardState:
         self.spot: Optional[BtcSpotTick] = None
         self.spot_history: deque[BtcSpotTick] = deque(maxlen=SPOT_HISTORY_LEN)
         self.markets: dict[str, MarketSnapshot] = {}
-        self.optimizer_status: Literal["idle", "running", "done", "error"] = "idle"
-        self.optimizer_error: Optional[str] = None
-        self.last_optimization: Optional[OptimizationResult] = None
-        self.optimizer_task: Optional[asyncio.Task[None]] = None
         self.stats: Optional[AgentStats] = None  # refreshed by the live trader
         self.activity: Optional[AgentActivity] = None
         self.evaluation: Optional[EvaluationReport] = None  # latest hourly evaluation
@@ -111,20 +106,16 @@ def _aware(moment: datetime) -> datetime:
 def create_app(
     state: Optional[DashboardState] = None,
     engine: Optional[AsyncEngine] = None,
-    optimizer_factory: Optional[Callable[[AsyncEngine], Optimizer]] = None,
     controls: Optional[TradingControls] = None,
     password: Optional[str] = None,
 ) -> FastAPI:
     state = state or DashboardState()
     engine = engine or make_engine()
-    optimizer_factory = optimizer_factory or (lambda e: Optimizer(e))
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         await init_db(engine)
         yield
-        if state.optimizer_task and not state.optimizer_task.done():
-            state.optimizer_task.cancel()
 
     app = FastAPI(title="BTC 15m Kalshi Agent", lifespan=lifespan)
     app.state.dashboard = state
@@ -141,15 +132,6 @@ def create_app(
             return Response(
                 "Authentication required", status_code=401, headers={"WWW-Authenticate": 'Basic realm="btc15m"'}
             )
-
-    async def run_optimizer() -> None:
-        try:
-            state.last_optimization = await optimizer_factory(engine).run()
-            state.optimizer_status = "done"
-        except Exception as exc:  # surfaced on the dashboard instead of dying silently
-            logger.exception("Optimizer run failed")
-            state.optimizer_error = str(exc)
-            state.optimizer_status = "error"
 
     def spot_context() -> dict[str, Any]:
         focus = state.focus_market()
@@ -173,23 +155,8 @@ def create_app(
         }
 
     async def backtest_context() -> dict[str, Any]:
-        result = state.last_optimization
-        chart = None
-        if result and result.best:
-            chart = line_chart_svg(
-                [(_aware(p.timestamp), p.equity) for p in result.best.equity_curve],
-                title="Backtest equity curve, best parameter set",
-                value_format=usd_cents,
-                reference_lines=[ReferenceLine(result.best.starting_bankroll, "Starting bankroll")],
-                chart_id="equity-chart",
-            )
-        return {
-            "status": state.optimizer_status,
-            "error": state.optimizer_error,
-            "result": result,
-            "chart": chart,
-            "active_params": await load_active_parameters(engine),
-        }
+        """Parameter tuning happens in the hourly evaluation; this panel shows its latest result."""
+        return {"evaluation": state.evaluation, "active_params": await load_active_parameters(engine)}
 
     async def markets_context() -> dict[str, Any]:
         return {
@@ -275,14 +242,6 @@ def create_app(
 
     @app.get("/partials/backtest", response_class=HTMLResponse)
     async def backtest_partial(request: Request) -> HTMLResponse:
-        return TEMPLATES.TemplateResponse(request, "partials/backtest.html", {"backtest_ctx": await backtest_context()})
-
-    @app.post("/optimize", response_class=HTMLResponse)
-    async def optimize(request: Request) -> HTMLResponse:
-        if state.optimizer_status != "running":
-            state.optimizer_status = "running"
-            state.optimizer_error = None
-            state.optimizer_task = asyncio.create_task(run_optimizer())
         return TEMPLATES.TemplateResponse(request, "partials/backtest.html", {"backtest_ctx": await backtest_context()})
 
     @app.get("/api/parameters")
