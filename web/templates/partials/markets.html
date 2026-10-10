@@ -3,7 +3,7 @@
          hx-get="/partials/markets" hx-trigger="every 2s" hx-swap="outerHTML">
   <h2>Active 15m options · model N(d₂) probabilities</h2>
   {% if m.markets %}
-  <table>
+  <div class="table-wrap"><table>
     <thead>
       <tr>
         <th>Ticker</th><th>Strike K</th><th>Spot − K</th><th>Time left</th>
@@ -40,7 +40,7 @@
       </tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% else %}
   <div class="empty">No active KXBTC15M markets yet. The live trader publishes them here.</div>
   {% endif %}

@@ -11,7 +11,7 @@
 
   <div class="subhead">Open positions ({{ a.positions | length }})</div>
   {% if a.positions %}
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr>
       <th>Ticker</th><th>Side</th><th>Contracts</th><th>Entry</th><th>Cost incl. fee</th>
       <th>Model win prob.</th><th>Mark (bid)</th><th>Unrealized</th><th>Settles in</th><th>Entered</th>
@@ -32,14 +32,14 @@
       </tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% else %}
     <div class="muted">No open positions.</div>
   {% endif %}
 
   <div class="subhead">Orders &amp; fills (last {{ a.orders | length }})</div>
   {% if a.orders %}
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr>
       <th>Time</th><th>Ticker</th><th>Side</th><th>Filled / requested</th><th>Price</th><th>Fee</th>
       <th>Status</th><th>Outcome</th><th>Net PnL</th><th>Order id</th>
@@ -60,14 +60,14 @@
       </tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% else %}
     <div class="muted">No orders yet. Resting orders are cancelled immediately, so there are never open orders: every order is either filled or cancelled.</div>
   {% endif %}
 
   <div class="subhead">LLM decisions (last {{ a.decisions | length }})</div>
   {% if a.decisions %}
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr>
       <th>Time</th><th>Ticker</th><th>Side @ ask</th><th>Edge</th><th>Model P(yes)</th><th>LLM P(yes)</th>
       <th>Confidence</th><th>Verdict</th><th>Reason</th><th>Cost</th>
@@ -89,16 +89,17 @@
         </td>
         <td class="reason">
           {% if d.decision == "skip" and d.approved and d.skip_reason %}<div>{{ d.skip_reason | replace("_", " ") }}</div>{% endif %}
+          {% set signals %}{% if d.risk_signals %}<div class="signals">{% for sig in d.risk_signals %}<span class="pill warning">{{ sig }}</span>{% endfor %}</div>{% endif %}{% endset %}
           {% if d.reasoning %}
-          <details><summary>{{ d.reasoning[:110] }}{% if d.reasoning | length > 110 %}…{% endif %}</summary>{{ d.reasoning }}</details>
-          {% endif %}
-          {% if d.risk_signals %}<div class="signals">{% for sig in d.risk_signals %}<span class="pill warning">{{ sig }}</span>{% endfor %}</div>{% endif %}
+          <details><summary>{{ d.reasoning[:110] }}{% if d.reasoning | length > 110 %}…{% endif %}</summary>{{ d.reasoning }}<div class="signals-in-details">{{ signals }}</div></details>
+          <div class="signals-inline">{{ signals }}</div>
+          {% else %}{{ signals }}{% endif %}
         </td>
         <td>{% if d.cost_usd is none %}—{% else %}${{ "%.4f" | format(d.cost_usd) }}{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% else %}
     <div class="muted">No LLM evaluations yet.</div>
   {% endif %}

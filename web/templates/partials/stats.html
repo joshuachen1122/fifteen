@@ -51,14 +51,14 @@
   {% if stats.screened_by_reason %}
   <details>
     <summary>Why candidates were screened out before the LLM</summary>
-    <table>
+    <div class="table-wrap"><table>
       <thead><tr><th>Reason</th><th>Candidates</th></tr></thead>
       <tbody>
         {% for reason, n in stats.screened_by_reason.items() %}
         <tr><td>{{ reason | replace("_", " ") }}</td><td>{{ "{:,}".format(n) }}</td></tr>
         {% endfor %}
       </tbody>
-    </table>
+    </table></div>
   </details>
   {% endif %}
   {% endif %}

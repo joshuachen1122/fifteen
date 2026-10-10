@@ -3,12 +3,14 @@
   <h2>Hourly evaluation · model, LLM gate &amp; edge</h2>
   {% if pricing %}
   <div class="toolbar">
-    <span>Trading on: <strong>{{ "settlement (60s average)" if pricing.model == "settlement" else "spot" }} model</strong>
-      {% if pricing.blend_weight < 1 %}blended {{ "%.0f" | format(pricing.blend_weight * 100) }}% model / {{ "%.0f" | format(100 - pricing.blend_weight * 100) }}% market{% else %}with no market blend{% endif %}</span>
+    {% macro blend(w) %}{% if w < 1 %}{{ "%.0f" | format(w * 100) }}% model / {{ "%.0f" | format(100 - w * 100) }}% market{% else %}raw model, no market blend{% endif %}{% endmacro %}
+    <span>Trading on: <strong>{{ "settlement (60s average)" if pricing.model == "settlement" else "spot" }} model</strong></span>
+    <span>· live: {{ blend(pricing.blend_weight) }}</span>
+    <span>· paper: {{ blend(pricing.blend_weight) if pricing.paper_market_blend else "raw model, no market blend" }}</span>
     <span class="muted">· {{ pricing.reason }} (settings: model={{ pricing.setting_model }}, blend={{ pricing.setting_blend }})</span>
   </div>
   {% if pricing.blend_weight == 0 %}
-  <div class="muted" style="margin-bottom: 8px;">At 0% model weight the agent's probability equals the market mid, so it finds no edge and does not trade. Snapshots and the hourly evaluation continue; trading resumes once the model earns weight back.</div>
+  <div class="muted" style="margin-bottom: 8px;">At 0% model weight the live probability equals the market mid, so live trading finds no edge and places no orders until the model earns weight back.{% if not pricing.paper_market_blend %} Paper keeps trading the raw model so the experiments keep collecting data.{% endif %}</div>
   {% endif %}
   {% if pricing.index_gap is defined %}
   <div class="muted" style="margin-bottom: 8px;">Spot inputs: Coinbase {{ "%+.2f" | format(pricing.index_gap) }} USD measured gap to the CF Benchmarks settlement index
@@ -26,7 +28,7 @@
 
   <div class="subhead">Who predicts outcomes better? (lower is better)</div>
   {% if e.scores %}
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr><th>Predictor</th><th>Brier score</th><th>Log loss</th><th>Snapshots</th></tr></thead>
     <tbody>
       {% set best = e.scores | min(attribute="log_loss") %}
@@ -35,7 +37,7 @@
         <td>{{ "%.4f" | format(s.brier) }}</td><td>{{ "%.4f" | format(s.log_loss) }}</td><td>{{ "{:,}".format(s.n) }}</td></tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% if e.best_blend_weight is not none %}
   <div class="muted" style="margin-top: 6px;">Best blend puts {{ "%.0f" | format(e.best_blend_weight * 100) }}% weight on the {{ e.best_model or "spot" }} model. Near 0% means the market price already contains everything our model knows.</div>
   {% endif %}
@@ -43,7 +45,7 @@
 
   {% if e.horizons %}
   <div class="subhead">Accuracy by time left (Brier, lower is better)</div>
-  <table>
+  <div class="table-wrap"><table>
     {% set has_settle = e.horizons[0].brier_settlement is not none %}
     <thead><tr><th>Time left</th><th>Market</th><th>Spot model</th>{% if has_settle %}<th>Settlement model</th>{% endif %}<th>Snapshots</th></tr></thead>
     <tbody>{% for h in e.horizons %}
@@ -55,25 +57,25 @@
         {% if has_settle %}<td class="{{ 'delta-up' if h.brier_settlement == lo else '' }}">{{ "%.4f" | format(h.brier_settlement) }}</td>{% endif %}
         <td>{{ "{:,}".format(h.n) }}</td></tr>
     {% endfor %}</tbody>
-  </table>
+  </table></div>
   {% endif %}
 
   {% if e.calibration %}
   <details>
     <summary>Model calibration: when it says X%, how often does YES happen?</summary>
-    <table>
+    <div class="table-wrap"><table>
       <thead><tr><th>Model says</th><th>Avg predicted</th><th>Actually YES</th><th>Snapshots</th></tr></thead>
       <tbody>{% for b in e.calibration %}
         <tr><td>{{ "%.0f" | format(b.lo * 100) }}–{{ "%.0f" | format(b.hi * 100) }}%</td><td>{{ "%.1f" | format(b.mean_predicted * 100) }}%</td>
           <td>{{ "%.1f" | format(b.realized * 100) }}%</td><td>{{ "{:,}".format(b.n) }}</td></tr>
       {% endfor %}</tbody>
-    </table>
+    </table></div>
   </details>
   {% endif %}
 
   <div class="subhead">Realized edge per contract, after fees</div>
   {% if e.edges %}
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr><th>Mode</th><th>Settled trades</th><th>Win rate</th><th>Avg price</th><th>Avg fee</th><th>Edge / contract</th><th>95% range</th><th>Total PnL</th></tr></thead>
     <tbody>{% for x in e.edges %}
       <tr><td>{{ x.mode | upper }}</td><td>{{ x.trades }}</td><td>{{ "%.1f" | format(x.win_rate * 100) }}%</td>
@@ -82,20 +84,20 @@
         <td class="muted">{% if x.trades > 1 %}{{ cents(x.ci_low_cents) }} to {{ cents(x.ci_high_cents) }}{% else %}need 2+ trades{% endif %}</td>
         <td>${{ "{:,.2f}".format(x.total_pnl) }}</td></tr>
     {% endfor %}</tbody>
-  </table>
+  </table></div>
   <div class="muted" style="margin-top: 6px;">The edge is proven only when the whole 95% range is above zero (green). Until then, it's indistinguishable from luck.</div>
   {% else %}<div class="muted">No settled trades yet.</div>{% endif %}
 
   <div class="subhead">Is the LLM gate worth it? (hypothetical 1 contract per reviewed candidate)</div>
   {% if e.llm %}
   {% set l = e.llm %}
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr><th>Verdict</th><th>Candidates</th><th>Avg result / contract</th></tr></thead>
     <tbody>
       <tr><td>Approved</td><td>{{ l.approved }}</td><td>{{ cents(l.approved_edge_cents) }}</td></tr>
       <tr><td>Vetoed</td><td>{{ l.vetoed }}</td><td>{{ cents(l.vetoed_edge_cents) }}</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <div class="muted" style="margin-top: 6px;">
     Vetoes {{ "saved" if l.saved_cents >= 0 else "cost" }} {{ "%.0f" | format(l.saved_cents | abs) }}¢ per contract-set.
     {% if l.brier_llm is not none %}Probability accuracy (Brier): LLM {{ "%.4f" | format(l.brier_llm) }} vs model {{ "%.4f" | format(l.brier_model) }}.{% endif %}
@@ -106,7 +108,7 @@
   {% set lm = e.learned %}
   <div class="subhead">Learned model (logistic, walk-forward: always tested on later contracts it never saw)</div>
   {% if lm.status != "ok" %}<div class="muted">{{ lm.status }}</div>{% else %}
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr><th>On {{ lm.test_contracts }} unseen contracts</th><th>Log loss</th><th>Brier</th></tr></thead>
     <tbody>
       {% set lo = [lm.log_loss_learned, lm.log_loss_market, lm.log_loss_model] | min %}
@@ -114,14 +116,14 @@
       <tr><td>Market (mid)</td><td class="{{ 'delta-up' if lm.log_loss_market == lo else '' }}">{{ "%.4f" | format(lm.log_loss_market) }}</td><td>{{ "%.4f" | format(lm.brier_market) }}</td></tr>
       <tr><td>Best hand-built model</td><td class="{{ 'delta-up' if lm.log_loss_model == lo else '' }}">{{ "%.4f" | format(lm.log_loss_model) }}</td><td class="muted">—</td></tr>
     </tbody>
-  </table>
+  </table></div>
   <div class="muted" style="margin-top: 6px;">Shadow only (not traded). Weights: {% for k, v in lm.coefficients.items() %}{{ k }} {{ "%+.2f" | format(v) }}{{ ", " if not loop.last }}{% endfor %}</div>
   {% endif %}
   {% endif %}
 
   <div class="subhead">Resting-order experiment (shadow bids, never sent; per contract)</div>
   {% if e.maker %}
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr><th>Candidates</th><th>Bids</th><th>Fill rate</th><th>Maker result if filled</th><th>Taker on same</th><th>Win rate filled / unfilled</th><th>Per opportunity: maker vs taker</th></tr></thead>
     <tbody>{% for m in e.maker %}
       <tr><td>{{ m.group }}</td><td>{{ m.orders }}</td><td>{{ "%.0f" | format(m.fill_rate * 100) }}%</td>
@@ -129,13 +131,13 @@
         <td>{% if m.win_rate_filled is not none %}{{ "%.0f" | format(m.win_rate_filled * 100) }}%{% else %}—{% endif %} / {% if m.win_rate_unfilled is not none %}{{ "%.0f" | format(m.win_rate_unfilled * 100) }}%{% else %}—{% endif %}</td>
         <td class="{{ 'delta-up' if m.maker_per_opportunity_cents > m.taker_per_opportunity_cents else 'delta-down' }}">{{ cents(m.maker_per_opportunity_cents) }} vs {{ cents(m.taker_per_opportunity_cents) }}</td></tr>
     {% endfor %}</tbody>
-  </table>
+  </table></div>
   <div class="muted" style="margin-top: 6px;">A bid fills when the public tape shows a taker selling our side at or through our price while it rests. Fills that win less often than unfilled bids are adverse selection.</div>
   {% else %}<div class="muted">No resolved shadow bids on settled contracts yet.</div>{% endif %}
 
   <div class="subhead">LLM cost experiment (same decisions re-asked through a cheaper model)</div>
   {% if e.llm_replays %}
-  <table>
+  <div class="table-wrap"><table>
     <thead><tr><th>Model</th><th>Decisions</th><th>Agrees with live</th><th>Approved (live / replay)</th><th>Approved result (live / replay)</th><th>Brier (live / replay)</th><th>Cost per call (live / replay)</th></tr></thead>
     <tbody>{% for r in e.llm_replays %}
       <tr><td>{{ r.model }} <span class="muted">vs {{ r.live_model }}</span></td><td>{{ r.decisions }}{% if r.failures %} <span class="muted">({{ r.failures }} failed)</span>{% endif %}</td>
@@ -144,14 +146,14 @@
         <td>{% if r.brier_live is not none %}{{ "%.4f" | format(r.brier_live) }} / {{ "%.4f" | format(r.brier_replay) }}{% else %}—{% endif %}</td>
         <td>{% if r.cost_per_call_live is not none %}${{ "%.4f" | format(r.cost_per_call_live) }}{% else %}—{% endif %} / {% if r.cost_per_call_replay is not none %}${{ "%.4f" | format(r.cost_per_call_replay) }}{% else %}—{% endif %}</td></tr>
     {% endfor %}</tbody>
-  </table>
+  </table></div>
   {% else %}<div class="muted">No replays yet: decisions are re-asked once their contract settles (daily budget applies).</div>{% endif %}
 
   <div class="subhead">Held-out backtest (tune on older 70%, test on newest 30%)</div>
   {% set b = e.backtest %}
   <div class="{{ 'delta-up' if b.applied else 'muted' }}">{{ b.status }}</div>
   {% if b.current %}
-  <table style="margin-top: 6px;">
+  <div class="table-wrap"><table style="margin-top: 6px;">
     <thead><tr><th>On held-out trades</th><th>Trades</th><th>Net PnL</th><th>Sharpe</th><th>Win rate</th><th>Min edge</th><th>Vol lookback</th><th>Momentum wt</th></tr></thead>
     <tbody>
       {% for label, r in [("Active parameters", b.current), ("Best tuned", b.best)] if r %}
@@ -160,7 +162,7 @@
         <td>{{ r.params.volatility_lookback_sec }}s</td><td>{{ "%.2f" | format(r.params.momentum_weight) }}</td></tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% endif %}
   {% endif %}
 </section>

@@ -41,7 +41,7 @@
     {{ b.chart | safe }}
     <details>
       <summary>Top {{ b.result.leaderboard | length }} parameter sets</summary>
-      <table>
+      <div class="table-wrap"><table>
         <thead><tr><th>#</th><th>Min edge</th><th>Vol lookback</th><th>Momentum w</th><th>Trades</th><th>Win rate</th><th>Net PnL</th><th>Sharpe</th></tr></thead>
         <tbody>
           {% for row in b.result.leaderboard %}
@@ -57,18 +57,18 @@
           </tr>
           {% endfor %}
         </tbody>
-      </table>
+      </table></div>
     </details>
     <details>
       <summary>Equity curve data table</summary>
-      <table>
+      <div class="table-wrap"><table>
         <thead><tr><th>Time (UTC)</th><th>Equity</th></tr></thead>
         <tbody>
           {% for pt in r.equity_curve %}
           <tr><td>{{ pt.timestamp.strftime("%Y-%m-%d %H:%M") }}</td><td>${{ "{:,.2f}".format(pt.equity) }}</td></tr>
           {% endfor %}
         </tbody>
-      </table>
+      </table></div>
     </details>
   {% elif b.status != "running" %}
     <div class="empty">No backtest yet. Click “Optimize Parameters” to replay settled trades.</div>

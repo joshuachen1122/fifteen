@@ -879,9 +879,17 @@ async def test_agent_follows_the_evaluation_pricing_choice_only_with_enough_evid
 
     agent.adopt_evaluation(_report(250, "settlement", {"spot": 0.6, "settlement": 0.4}))
     assert (agent.pricing_model, agent.blend_weight) == ("settlement", 0.4)
-    blended = yes_candidate(agent).fair_value
-    mid = (YES_BID + YES_ASK) / 200
     settle = agent.model_values(candidate.market_state, candidate.quote)["settlement"].model_probability
+    # Paper trades the raw model so experiments keep collecting data; the blend protects live money.
+    assert agent.client.is_paper and agent.effective_blend_weight == 1.0
+    assert yes_candidate(agent).fair_value.model_probability == pytest.approx(settle)
+    agent.client.trading_enabled = True  # what live trading would price on (no order is sent here)
+    assert agent.effective_blend_weight == 0.4
+    blended = yes_candidate(agent).fair_value
+    agent.client.trading_enabled = False
+    agent.settings.paper_market_blend = True
+    assert yes_candidate(agent).fair_value.model_probability == pytest.approx(blended.model_probability)
+    mid = (YES_BID + YES_ASK) / 200
     assert blended.model_probability == pytest.approx(0.4 * settle + 0.6 * mid)
     assert blended.model_probability < raw  # shrunk toward the 78c mid
     assert agent.dashboard.pricing.items() >= {

@@ -104,6 +104,9 @@ class Settings(BaseSettings):
     # contracts of evidence; until then the agent trades the spot model without a market blend.
     pricing_model: Literal["auto", "spot", "settlement"] = "auto"
     market_blend: Literal["auto", "off"] = "auto"  # auto: p = w*model + (1-w)*market mid, w fitted hourly
+    # The blend protects real money. Paper trades the raw model by default so the experiments keep
+    # collecting data even when the fitted weight is 0% (which means live finds no edge at all).
+    paper_market_blend: bool = False
     model_min_contracts: int = 50
 
     # Experiments (shadow only: nothing here places orders)
@@ -442,7 +445,14 @@ class TradingAgent:
         return self._active_fair_value(self.model_values(state, quote), quote)
 
     def _active_fair_value(self, values: dict[PricingModel, FairValueOutput], quote: MarketQuote) -> FairValueOutput:
-        return blend_with_market(values[self.pricing_model], quote, self.blend_weight)
+        return blend_with_market(values[self.pricing_model], quote, self.effective_blend_weight)
+
+    @property
+    def effective_blend_weight(self) -> float:
+        """Market-blend weight for the current mode: the fitted weight live, 1.0 (raw model) on paper."""
+        if self.client.is_paper and not self.settings.paper_market_blend:
+            return 1.0
+        return self.blend_weight
 
     def adopt_evaluation(self, report: EvaluationReport) -> None:
         """Follow the hourly report's choice of pricing model and market blend (when set to auto)."""
@@ -501,6 +511,7 @@ class TradingAgent:
             "long_vol_hours": self.settings.long_vol_lookback_sec / 3600,
             "model": self.pricing_model,
             "blend_weight": self.blend_weight,
+            "paper_market_blend": self.settings.paper_market_blend,
             "reason": self.pricing_reason,
             "setting_model": self.settings.pricing_model,
             "setting_blend": self.settings.market_blend,

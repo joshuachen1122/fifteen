@@ -28,14 +28,14 @@
   {% if s.history %}
   <details>
     <summary>Data table (last {{ s.history | length }} ticks)</summary>
-    <table>
+    <div class="table-wrap"><table>
       <thead><tr><th>Time (UTC)</th><th>Price</th></tr></thead>
       <tbody>
         {% for t in s.history | reverse %}
         <tr><td>{{ t.timestamp.strftime("%H:%M:%S") }}</td><td>${{ "{:,.2f}".format(t.price) }}</td></tr>
         {% endfor %}
       </tbody>
-    </table>
+    </table></div>
   </details>
   {% endif %}
 </section>
