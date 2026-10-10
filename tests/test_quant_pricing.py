@@ -227,3 +227,70 @@ def test_entry_guardrail_threshold(seconds, allowed):
     assert result.greeks.seconds_remaining == seconds
     if not allowed:
         assert "pinning" in result.reason
+
+
+# ---------------------------------------------------------------- settlement-average pricing
+
+from pricing.btc_digital_option import D2_DEGENERATE  # noqa: E402
+from pricing.settlement import blend_with_market, price_settlement_average, settlement_average_d  # noqa: E402
+
+
+def _spot_p(spot: float, strike: float, sigma: float, seconds: float) -> float:
+    from pricing.btc_digital_option import compute_d2, norm_cdf, seconds_to_years
+
+    return norm_cdf(compute_d2(spot, strike, sigma, seconds_to_years(seconds)))
+
+
+def test_averaging_removes_variance_so_in_the_money_contracts_are_more_certain() -> None:
+    from pricing.btc_digital_option import norm_cdf
+
+    s, k, sigma = 82_600.0, 82_500.0, 0.4
+    for seconds in (120, 300, 600):
+        assert norm_cdf(settlement_average_d(s, k, sigma, seconds)) > _spot_p(s, k, sigma, seconds)
+        assert norm_cdf(settlement_average_d(k - 100, k, sigma, seconds)) < _spot_p(k - 100, k, sigma, seconds)
+    # Far from expiry the average barely matters; at 2 minutes left it removes a third of the variance.
+    far = norm_cdf(settlement_average_d(s, k, sigma, 3 * 3600)), _spot_p(s, k, sigma, 3 * 3600)
+    assert far[0] == pytest.approx(far[1], abs=0.005)
+
+
+def test_inside_the_final_minute_the_observed_average_dominates() -> None:
+    from pricing.btc_digital_option import norm_cdf
+
+    k, sigma = 82_500.0, 0.4
+    observed = [k + 50.0] * 50  # 50 seconds already averaged $50 above the strike
+    # Spot just dipped below the strike, but only 10 seconds of the average are left to move.
+    p = norm_cdf(settlement_average_d(k - 5.0, k, sigma, 10, observed))
+    assert p > 0.99 and _spot_p(k - 5.0, k, sigma, 10) < 0.5
+    # The reverse: the window so far is below the strike and spot barely above it.
+    assert norm_cdf(settlement_average_d(k + 5.0, k, sigma, 10, [k - 50.0] * 50)) < 0.01
+
+
+def test_settlement_degenerate_cases() -> None:
+    k = 82_500.0
+    assert settlement_average_d(k, k, 0.4, 0, [k + 1.0] * 60) == D2_DEGENERATE  # decided: average above
+    assert settlement_average_d(k, k, 0.4, 0, [k - 1.0] * 60) == -D2_DEGENERATE
+    assert settlement_average_d(k, k, 0.4, 1, [10 * k] * 59) == D2_DEGENERATE  # K_eff <= 0
+    assert settlement_average_d(k + 1, k, 0.0, 300) == D2_DEGENERATE  # no volatility left
+    with pytest.raises(ValueError):
+        settlement_average_d(-1.0, k, 0.4, 300)
+
+
+def test_price_settlement_average_and_market_blend() -> None:
+    from datetime import datetime, timezone
+
+    from core.schemas import Btc15mMarketState, MarketQuote
+
+    now = datetime(2026, 10, 9, tzinfo=timezone.utc)
+    state = Btc15mMarketState(
+        ticker="T", strike_price=82_500, expiration_time=now, seconds_remaining=120, current_spot_price=82_600,
+        historical_volatility=0.4, momentum_1m=0.0, order_book_imbalance=0.0,
+    )
+    quote = MarketQuote(ticker="T", strike_price=82_500, yes_bid=70, yes_ask=74, volume=0, updated_at=now)
+    fair = price_settlement_average(state, quote)
+    assert fair.gross_edge == pytest.approx(fair.model_probability - 0.74)
+    assert blend_with_market(fair, quote, 1.0) is fair
+    market_only = blend_with_market(fair, quote, 0.0)
+    assert market_only.model_probability == pytest.approx(0.72) and market_only.fair_cents == 72
+    half = blend_with_market(fair, quote, 0.5)
+    assert half.model_probability == pytest.approx(0.5 * fair.model_probability + 0.36)
+    assert half.gross_edge == pytest.approx(half.model_probability - 0.74)

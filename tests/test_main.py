@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -11,8 +12,15 @@ from sqlmodel import select
 
 from core.schemas import BtcSpotTick, FairValueOutput, LLMVerdict
 from db.database import Database
-from db.models import ContractOutcome, EvaluationReportRecord, EvaluationTraceRecord, MarketSnapshot, TradeRecord
-from execution.kalshi_client import KalshiClient, KalshiMarket
+from db.models import (
+    ContractOutcome,
+    EvaluationReportRecord,
+    EvaluationTraceRecord,
+    MakerShadowOrder,
+    MarketSnapshot,
+    TradeRecord,
+)
+from execution.kalshi_client import KalshiClient, KalshiMarket, PublicTrade
 from execution.order_scanner import OrderBook, ScanCandidate
 from main import Settings, TradingAgent
 from services.btc_spot_feed import BtcSpotFeed
@@ -60,14 +68,22 @@ class FakeEvaluator:
 
 
 class SettlingClient(KalshiClient):
-    """Paper client whose settlement lookups are served from memory."""
+    """Paper client whose settlement, series and trade-tape lookups are served from memory."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.results: dict[str, KalshiMarket] = {}
+        self.trades: list[PublicTrade] = []
+        self.fee_type = "quadratic"
 
     async def get_market(self, ticker: str) -> KalshiMarket:
         return self.results[ticker]
+
+    async def get_series(self, series_ticker: str) -> dict[str, Any]:
+        return {"ticker": series_ticker, "fee_type": self.fee_type, "exchange_index": 2}
+
+    async def get_trades(self, ticker: str, *, min_ts: datetime, max_ts: datetime, **_: Any) -> list[PublicTrade]:
+        return [t for t in self.trades if t.ticker == ticker and min_ts <= t.created_time <= max_ts]
 
 
 @pytest.fixture
@@ -759,6 +775,9 @@ async def test_market_snapshots_are_recorded_unconditionally(db: Database) -> No
         [snap] = (await s.exec(select(MarketSnapshot))).all()
     assert (snap.ticker, snap.yes_bid, snap.yes_ask, snap.seconds_remaining) == (TICKER, YES_BID, YES_ASK, 600)
     assert 0 < snap.model_probability < 1 and snap.historical_volatility > 0
+    # Both pricing models are recorded side by side; the agent trades the spot model by default.
+    assert snap.spot_model_probability == snap.model_probability
+    assert snap.settlement_model_probability is not None and 0 < snap.settlement_model_probability < 1
 
     advance(agent, clock, timedelta(seconds=1))
     await agent.sync_markets()
@@ -807,6 +826,7 @@ async def test_hourly_evaluation_runs_in_a_subprocess_and_reaches_the_dashboard(
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as http:
             page = await http.get("/partials/evaluation")
         assert page.status_code == 200 and "Held-out backtest" in page.text and "waiting for data" in page.text
+        assert "Trading on: <strong>spot model</strong>" in page.text and "Resting-order experiment" in page.text
     finally:
         await database.dispose()
 
@@ -829,3 +849,98 @@ async def test_no_pricing_or_snapshots_until_volatility_has_a_full_window(db: Da
         cold.buffer.add_tick(BtcSpotTick(source="coinbase", price=82_700.0 + (i % 5), timestamp=T0 + timedelta(seconds=i)))
     clock.now = T0 + timedelta(seconds=199)
     assert agent.spot_warm() and agent.spot_context() is not None
+
+
+# ---------------------------------------------------------------- pricing model selection & experiments
+
+from services.evaluation import EvaluationReport, HoldoutBacktest  # noqa: E402
+
+
+def _report(model_contracts: int, best_model: str, weights: dict[str, float]) -> EvaluationReport:
+    return EvaluationReport(
+        created_at=T0, contracts=model_contracts, snapshots=model_contracts * 100, scores=[],
+        best_blend_weight=weights.get(best_model), best_model=best_model, model_contracts=model_contracts,
+        blend_weights=weights, calibration=[], horizons=[], edges=[], llm=None,
+        backtest=HoldoutBacktest(status="waiting"), notes=[],
+    )
+
+
+async def test_agent_follows_the_evaluation_pricing_choice_only_with_enough_evidence(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator(), model_min_contracts=200)
+    await agent.restore()
+    candidate = yes_candidate(agent)
+    raw = candidate.fair_value.model_probability
+
+    agent.adopt_evaluation(_report(50, "settlement", {"spot": 0.6, "settlement": 0.4}))
+    assert (agent.pricing_model, agent.blend_weight) == ("spot", 1.0)  # not enough contracts yet
+    assert "50 so far" in agent.dashboard.pricing["reason"]
+
+    agent.adopt_evaluation(_report(250, "settlement", {"spot": 0.6, "settlement": 0.4}))
+    assert (agent.pricing_model, agent.blend_weight) == ("settlement", 0.4)
+    blended = yes_candidate(agent).fair_value
+    mid = (YES_BID + YES_ASK) / 200
+    settle = agent.model_values(candidate.market_state, candidate.quote)["settlement"].model_probability
+    assert blended.model_probability == pytest.approx(0.4 * settle + 0.6 * mid)
+    assert blended.model_probability < raw  # shrunk toward the 78c mid
+    assert agent.dashboard.pricing == {
+        "model": "settlement", "blend_weight": 0.4, "reason": "hourly evaluation over 250 settled contracts",
+        "setting_model": "auto", "setting_blend": "auto",
+    }
+
+
+async def test_fixed_pricing_settings_override_the_evaluation(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator(), pricing_model="spot", market_blend="off")
+    await agent.restore()
+    agent.adopt_evaluation(_report(500, "settlement", {"spot": 0.3, "settlement": 0.2}))
+    assert (agent.pricing_model, agent.blend_weight) == ("spot", 1.0)
+
+
+async def test_llm_reviewed_candidates_record_a_replayable_input_and_a_maker_shadow(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.restore()
+    assert agent.fee_type == "quadratic"
+    await agent.handle_candidate(yes_candidate(agent))
+
+    async with db.session() as s:
+        [trace] = (await s.exec(select(EvaluationTraceRecord))).all()
+        [shadow] = (await s.exec(select(MakerShadowOrder))).all()
+    payload = json.loads(trace.llm_input_json or "")
+    assert payload["candidate"]["ticker"] == TICKER and payload["context"]["proposed_side"] == "yes"
+    # YES book 76/80: improve the bid by a cent and rest for maker_ttl_sec; no maker fee on this series.
+    assert (shadow.side, shadow.limit_cents, shadow.joined_queue, shadow.taker_ask_cents) == ("yes", 77, False, YES_ASK)
+    assert shadow.maker_fee_cents == 0 and shadow.llm_should_bet is True
+    assert shadow.cancel_at == T0 + timedelta(seconds=180) and shadow.filled is None
+
+    assert await agent.resolve_maker_shadows() == 0  # still resting
+    assert isinstance(agent.client, SettlingClient)
+    agent.client.trades = [
+        # A taker buying YES lifts asks: never fills our YES bid.
+        PublicTrade(ticker=TICKER, created_time=T0 + timedelta(seconds=20), yes_price_cents=80, no_price_cents=20, count=5, taker_side="yes"),
+        # A taker buying NO at 24c sells YES at 76c, below our 77c bid: we'd have been hit first.
+        PublicTrade(ticker=TICKER, created_time=T0 + timedelta(seconds=90), yes_price_cents=76, no_price_cents=24, count=3, taker_side="no"),
+    ]
+    clock.now = T0 + timedelta(seconds=181)
+    assert await agent.resolve_maker_shadows() == 1
+    async with db.session() as s:
+        [shadow] = (await s.exec(select(MakerShadowOrder))).all()
+    assert shadow.filled is True and shadow.filled_at == T0 + timedelta(seconds=90) and shadow.fill_trade_cents == 76
+    assert await agent.resolve_maker_shadows() == 0
+
+
+async def test_vetoed_candidates_get_a_maker_shadow_too_but_unpaid_screens_do_not(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator(should_bet=False))
+    await agent.restore()
+    await agent.handle_candidate(yes_candidate(agent))
+    agent_no_llm = make_agent(db, clock, None)
+    await agent_no_llm.restore()
+    clock.now += timedelta(seconds=1)
+    await agent_no_llm.handle_candidate(yes_candidate(agent_no_llm))
+    async with db.session() as s:
+        shadows = (await s.exec(select(MakerShadowOrder))).all()
+        traces = (await s.exec(select(EvaluationTraceRecord))).all()
+    assert [sh.llm_should_bet for sh in shadows] == [False]
+    assert len(traces) == 2 and traces[1].llm_input_json is None  # no LLM call, nothing to replay

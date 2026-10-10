@@ -25,6 +25,15 @@ def kalshi_taker_fee_cents(count: int, price_cents: int) -> int:
     return -(-numerator // 10_000)
 
 
+def kalshi_maker_fee_cents(count: int, price_cents: int, fee_type: str | None) -> int:
+    """Fee on a resting order that gets filled. Kalshi charges makers only on series whose
+    `fee_type` is "quadratic_with_maker_fees": ceil(0.0175 * C * P * (1 - P)) dollars."""
+    if count <= 0 or fee_type != "quadratic_with_maker_fees":
+        return 0
+    numerator = 175 * count * price_cents * (100 - price_cents)
+    return -(-numerator // 1_000_000)
+
+
 def kelly_fraction(win_probability: float, price_cents: int) -> float:
     """Full-Kelly bankroll fraction for buying a $1 binary contract, net of taker fees.
 

@@ -8,8 +8,10 @@
                                ▼
                        KalshiClient (paper or live, rate-limited)
 
-    Settlement poller (every 3 min): settle expired markets, book net PnL into the
-    RiskEngine, and re-tune StrategyParameters nightly or after every N settled trades.
+    Settlement poller (every 3 min): settle expired markets and book net PnL into the
+    RiskEngine. Hourly evaluation (separate process): scores the pricing models against
+    outcomes, picks the model / market blend to trade on, and applies tuned parameters only
+    when they win on held-out trades.
 
 Run with: python main.py   (configuration is read from the environment, see .env.example)
 """
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import os
@@ -25,7 +28,7 @@ import signal
 import sys
 from collections import Counter
 from collections.abc import Callable, Iterator
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Literal, Optional
 
 import uvicorn
@@ -44,6 +47,7 @@ from db.models import (
     ContractOutcome,
     EvaluationReportRecord,
     EvaluationTraceRecord,
+    MakerShadowOrder,
     MarketSnapshot,
     RuntimeSetting,
     TradeRecord,
@@ -53,17 +57,20 @@ from execution.kalshi_client import KalshiAPIError, KalshiClient, KalshiMarket, 
 from execution.order_scanner import KalshiOrderBookScanner, ScanCandidate, SpotContext
 from pricing.btc_digital_option import price_digital_option
 from pricing.greeks import MIN_ENTRY_SECONDS, check_entry_guardrail
+from pricing.settlement import SETTLEMENT_WINDOW_SEC, blend_with_market, price_settlement_average
 from services.btc_spot_feed import BtcSpotFeed
 from services.agent_stats import compute_activity, compute_stats
 from services.evaluation import EvaluationReport
 from services.llm_evaluator import LLMEvaluator, LLMUsage
+from services.maker_experiment import first_fill, maker_limit, side_quotes
 from services.optimizer import Optimizer, load_active_parameters
-from services.risk_engine import Position, RiskEngine, kalshi_taker_fee_cents
+from services.risk_engine import Position, RiskEngine, kalshi_maker_fee_cents, kalshi_taker_fee_cents
 from web.app import DashboardState, create_app
 
 logger = logging.getLogger("btc15m")
 
 Side = Literal["yes", "no"]
+PricingModel = Literal["spot", "settlement"]
 
 
 class Settings(BaseSettings):
@@ -86,6 +93,19 @@ class Settings(BaseSettings):
     llm_min_seconds_remaining: int = 60  # too little time left to act on a verdict
     max_plausible_edge: float = 0.30  # larger "edges" are almost always bad quotes, not mispricing
     llm_daily_budget_usd: float = 5.0  # hard cap; past it the agent fails closed (no LLM, no trades)
+
+    # Pricing. "auto" follows the hourly evaluation once it has `model_min_contracts` settled
+    # contracts of evidence; until then the agent trades the spot model without a market blend.
+    pricing_model: Literal["auto", "spot", "settlement"] = "auto"
+    market_blend: Literal["auto", "off"] = "auto"  # auto: p = w*model + (1-w)*market mid, w fitted hourly
+    model_min_contracts: int = 200
+
+    # Experiments (shadow only: nothing here places orders)
+    maker_shadow_enabled: bool = True  # record the resting bid we could have posted per LLM-reviewed candidate
+    maker_ttl_sec: float = 180.0  # how long that bid would rest before being cancelled
+    llm_replay_model: str = "claude-haiku-5-5"  # re-ask logged decisions through a cheaper model
+    llm_replay_effort: str = "low"
+    llm_replay_daily_usd: float = 0.25  # 0 disables replays
 
     # Real-money controls. These are defaults: changes made on the dashboard are persisted and win.
     max_trade_usd: float = 1.00  # all-in cost (price + fee) of any single order
@@ -168,6 +188,11 @@ class TradingAgent:
         self._latest_tick: Optional[BtcSpotTick] = None
         self._last_dashboard_tick: Optional[datetime] = None
         self._snapshots: dict[str, MarketSnapshot] = {}  # latest per live contract, written every few seconds
+        self.pricing_model: PricingModel = "settlement" if settings.pricing_model == "settlement" else "spot"
+        self.blend_weight = 1.0  # weight on the model vs the market mid (1.0 = no blend)
+        self.pricing_reason = "default until the hourly evaluation has enough settled contracts"
+        self.fee_type: Optional[str] = None  # series fee schedule ("quadratic" = no maker fees)
+        self._publish_pricing()
 
     @property
     def params(self) -> StrategyParameters:
@@ -182,6 +207,11 @@ class TradingAgent:
     async def restore(self) -> None:
         """Rebuild bankroll, open positions, and active parameters after a (re)start."""
         await self.reload_parameters()
+        if self.fee_type is None:
+            try:
+                self.fee_type = (await self.client.get_series(self.scanner.series_ticker)).get("fee_type") or "quadratic"
+            except KalshiAPIError as exc:
+                logger.warning("could not read the series fee schedule (assuming no maker fees): %s", exc)
         now = self._clock()
         self._positions.clear()
         self._trade_rows.clear()
@@ -390,8 +420,53 @@ class TradingAgent:
             return None
         return SpotContext(spot_price=price, historical_volatility=vol, momentum_1m=momentum)
 
+    def model_values(self, state: Btc15mMarketState, quote: MarketQuote) -> dict[PricingModel, FairValueOutput]:
+        """Both raw pricing models (no market blend) for one contract."""
+        elapsed = SETTLEMENT_WINDOW_SEC - state.seconds_remaining
+        observed = self.feed.buffer.snapshot(elapsed - 1) if elapsed > 0 else []
+        return {
+            "spot": price_digital_option(state, quote, self.params),
+            "settlement": price_settlement_average(state, quote, self.params, observed=observed),
+        }
+
     def fair_value(self, state: Btc15mMarketState, quote: MarketQuote) -> FairValueOutput:
-        return price_digital_option(state, quote, self.params)
+        """The probability the agent trades on: the active model, shrunk toward the market mid."""
+        return self._active_fair_value(self.model_values(state, quote), quote)
+
+    def _active_fair_value(self, values: dict[PricingModel, FairValueOutput], quote: MarketQuote) -> FairValueOutput:
+        return blend_with_market(values[self.pricing_model], quote, self.blend_weight)
+
+    def adopt_evaluation(self, report: EvaluationReport) -> None:
+        """Follow the hourly report's choice of pricing model and market blend (when set to auto)."""
+        s = self.settings
+        enough = report.model_contracts >= s.model_min_contracts
+        if s.pricing_model == "auto":
+            model: PricingModel = report.best_model if enough and report.best_model in ("spot", "settlement") else "spot"
+        else:
+            model = s.pricing_model
+        weight = 1.0
+        if s.market_blend == "auto" and enough and model in report.blend_weights:
+            weight = report.blend_weights[model]
+        if enough:
+            reason = f"hourly evaluation over {report.model_contracts} settled contracts"
+        else:
+            reason = f"default until {s.model_min_contracts} settled contracts are scored ({report.model_contracts} so far)"
+        if (model, weight) != (self.pricing_model, self.blend_weight):
+            logger.warning(
+                "pricing: %s model, %.0f%% weight on model vs market (was %s, %.0f%%; %s)",
+                model, weight * 100, self.pricing_model, self.blend_weight * 100, reason,
+            )
+        self.pricing_model, self.blend_weight, self.pricing_reason = model, weight, reason
+        self._publish_pricing()
+
+    def _publish_pricing(self) -> None:
+        self.dashboard.pricing = {
+            "model": self.pricing_model,
+            "blend_weight": self.blend_weight,
+            "reason": self.pricing_reason,
+            "setting_model": self.settings.pricing_model,
+            "setting_blend": self.settings.market_blend,
+        }
 
     async def persist_spot_loop(self) -> None:
         """Downsample spot ticks into SQLite so the backtester can replay volatility."""
@@ -481,7 +556,8 @@ class TradingAgent:
             await self.state_manager.update_order_book_imbalance(ticker, book.imbalance)
             state = await self.state_manager.get_market_state(ticker)
             if state is not None and self.spot_warm():
-                fair = self.fair_value(state, quote)
+                values = self.model_values(state, quote)
+                fair = self._active_fair_value(values, quote)
                 self.dashboard.update_market(state, fair, quote)
                 self._snapshots[ticker] = MarketSnapshot(
                     ts=self._clock(),
@@ -496,6 +572,8 @@ class TradingAgent:
                     momentum_1m=state.momentum_1m,
                     order_book_imbalance=state.order_book_imbalance,
                     model_probability=fair.model_probability,
+                    spot_model_probability=values["spot"].model_probability,
+                    settlement_model_probability=values["settlement"].model_probability,
                 )
 
     # -- decision pipeline -----------------------------------------------------
@@ -541,7 +619,8 @@ class TradingAgent:
             return
 
         self._last_evaluated[(c.ticker, c.side)] = now
-        verdict, usage = await self._llm_verdict(c, guard.greeks.delta)
+        context = self._llm_context(c, guard.greeks.delta)
+        verdict, usage = await self._llm_verdict(c, context)
         if usage is not None:
             self._llm_calls[c.ticker] += 1
             self._add_llm_spend(usage.cost_usd, now)
@@ -585,8 +664,11 @@ class TradingAgent:
                     if position is None:
                         skip_reason = "order_not_filled"
 
-        evaluation_id = await self._record_evaluation(c, verdict, usage, skip_reason)
+        llm_input = json.dumps({"candidate": c.fair_value.model_dump(mode="json"), "context": context}, default=str)
+        evaluation_id = await self._record_evaluation(c, verdict, usage, skip_reason, llm_input if usage else None)
         await self._record_trade(c, evaluation_id, ask, order, result, position, now)
+        if usage is not None and self.settings.maker_shadow_enabled:
+            await self._record_maker_shadow(c, evaluation_id, verdict, p_win)
 
     def _llm_screen(self, c: ScanCandidate, now: datetime) -> Optional[str]:
         """Free checks that decide whether a candidate is worth a paid LLM call. Returns the reason to skip."""
@@ -627,7 +709,7 @@ class TradingAgent:
             ).one()
         self._llm_spend_day, self._llm_spend_today_usd = now.date(), float(spent)
 
-    async def _llm_verdict(self, c: ScanCandidate, delta: float) -> tuple[LLMVerdict, Optional[LLMUsage]]:
+    async def _llm_verdict(self, c: ScanCandidate, context: dict[str, Any]) -> tuple[LLMVerdict, Optional[LLMUsage]]:
         if self.evaluator is None:
             verdict = LLMVerdict(
                 should_bet=False,
@@ -637,9 +719,12 @@ class TradingAgent:
                 risk_signals=["LLM unavailable"],
             )
             return verdict, None
+        return await self.evaluator.evaluate_with_usage(c.fair_value, context)
+
+    def _llm_context(self, c: ScanCandidate, delta: float) -> dict[str, Any]:
         assert self.risk is not None
         state = c.market_state
-        context = {
+        return {
             "note": "The candidate's model_probability, fair_cents and gross_edge are for the YES side. "
             "proposed_side_* fields are for the side being bought (NO ask = 100 - yes_bid).",
             "proposed_side": c.side,
@@ -662,7 +747,6 @@ class TradingAgent:
             "open_positions": len(self._positions),
             "utc_time": self._clock().isoformat(),
         }
-        return await self.evaluator.evaluate_with_usage(c.fair_value, context)
 
     def _current_ask(self, ticker: str, side: Side) -> Optional[int]:
         book = self.scanner.books.get(ticker)
@@ -717,7 +801,12 @@ class TradingAgent:
         return any(p.ticker == ticker for p in self._positions.values())
 
     async def _record_evaluation(
-        self, c: ScanCandidate, verdict: LLMVerdict, usage: Optional[LLMUsage], skip_reason: Optional[str]
+        self,
+        c: ScanCandidate,
+        verdict: LLMVerdict,
+        usage: Optional[LLMUsage],
+        skip_reason: Optional[str],
+        llm_input: Optional[str] = None,
     ) -> int:
         s, fv = c.market_state, c.fair_value
         record = EvaluationTraceRecord(
@@ -751,6 +840,7 @@ class TradingAgent:
             llm_cache_read_tokens=usage.cache_read_tokens if usage else None,
             llm_cache_write_tokens=usage.cache_write_tokens if usage else None,
             llm_cost_usd=usage.cost_usd if usage else None,
+            llm_input_json=llm_input,
             decision="skip" if skip_reason else "trade",
             skip_reason=skip_reason,
         )
@@ -760,6 +850,80 @@ class TradingAgent:
             await session.refresh(record)
         assert record.id is not None
         return record.id
+
+    async def _record_maker_shadow(self, c: ScanCandidate, evaluation_id: int, verdict: LLMVerdict, p_win: float) -> None:
+        """Record the resting bid we could have posted instead of crossing the spread (never sent)."""
+        side_bid, side_ask = side_quotes(c.side, c.quote.yes_bid, c.quote.yes_ask)
+        limit = maker_limit(side_bid, side_ask)
+        market = self.scanner.markets.get(c.ticker)
+        if limit is None or market is None:
+            return
+        now = self._clock()
+        cancel_at = min(
+            now + timedelta(seconds=self.settings.maker_ttl_sec),
+            market.close_time - timedelta(seconds=MIN_ENTRY_SECONDS),
+        )
+        if cancel_at <= now:
+            return
+        price, joined = limit
+        async with self.db.session() as session:
+            session.add(
+                MakerShadowOrder(
+                    created_at=now,
+                    evaluation_id=evaluation_id,
+                    ticker=c.ticker,
+                    side=c.side,
+                    is_paper=self.client.is_paper,
+                    llm_should_bet=verdict.should_bet,
+                    close_time=market.close_time,
+                    cancel_at=cancel_at,
+                    limit_cents=price,
+                    joined_queue=joined,
+                    taker_ask_cents=c.ask_cents,
+                    maker_fee_cents=kalshi_maker_fee_cents(1, price, self.fee_type),
+                    win_probability=p_win,
+                )
+            )
+            await session.commit()
+
+    async def resolve_maker_shadows(self, limit: int = 50) -> int:
+        """Replay the public trade tape over each expired shadow bid to see if it would have filled."""
+        now = self._clock()
+        async with self.db.session() as session:
+            pending = list(
+                (
+                    await session.exec(
+                        select(MakerShadowOrder)
+                        .where(col(MakerShadowOrder.resolved_at).is_(None), MakerShadowOrder.cancel_at <= now)
+                        .order_by(col(MakerShadowOrder.cancel_at))
+                        .limit(limit)
+                    )
+                ).all()
+            )
+        by_ticker: dict[str, list[MakerShadowOrder]] = {}
+        for row in pending:
+            by_ticker.setdefault(row.ticker, []).append(row)
+        resolved = 0
+        for ticker, rows in by_ticker.items():
+            start, end = min(r.created_at for r in rows), max(r.cancel_at for r in rows)
+            try:
+                trades = await self.client.get_trades(ticker, min_ts=start, max_ts=end)
+            except KalshiAPIError as exc:
+                logger.warning("could not fetch trades for %s: %s", ticker, exc)
+                continue
+            async with self.db.session() as session:
+                for row in rows:
+                    fill = first_fill(row.side, row.limit_cents, row.joined_queue, trades, row.created_at, row.cancel_at)  # type: ignore[arg-type]
+                    row.filled = fill is not None
+                    row.filled_at = fill.created_time if fill else None
+                    row.fill_trade_cents = (
+                        (fill.yes_price_cents if row.side == "yes" else fill.no_price_cents) if fill else None
+                    )
+                    row.resolved_at = now
+                    session.add(row)
+                    resolved += 1
+                await session.commit()
+        return resolved
 
     async def _record_trade(
         self,
@@ -825,6 +989,7 @@ class TradingAgent:
     async def poll_once(self) -> None:
         await self.settle_completed()
         await self.record_contract_outcomes()
+        await self.resolve_maker_shadows()
         await self.load_latest_evaluation()  # also shows reports from manual runs
         # Parameters change only via the hourly held-out evaluation or the dashboard's optimizer.
         await self.reload_parameters()
@@ -910,6 +1075,9 @@ class TradingAgent:
             "AUTO_APPLY_PARAMS": "true" if self.settings.auto_apply_params else "false",
             "AUTO_APPLY_MIN_TRADES": str(self.settings.auto_apply_min_trades),
             "AUTO_APPLY_COOLDOWN_HOURS": str(self.settings.auto_apply_cooldown_hours),
+            "LLM_REPLAY_MODEL": self.settings.llm_replay_model,
+            "LLM_REPLAY_EFFORT": self.settings.llm_replay_effort,
+            "LLM_REPLAY_DAILY_USD": str(self.settings.llm_replay_daily_usd),
         }
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "services.evaluation",
@@ -940,7 +1108,9 @@ class TradingAgent:
                 )
             ).first()
         if row is not None:
-            self.dashboard.evaluation = EvaluationReport.model_validate_json(row.report_json)
+            report = EvaluationReport.model_validate_json(row.report_json)
+            self.dashboard.evaluation = report
+            self.adopt_evaluation(report)
 
     async def settle_completed(self) -> int:
         """Record outcomes for expired markets. Returns the number of our positions settled."""

@@ -157,6 +157,30 @@ class KalshiMarket(BaseModel):
         )
 
 
+class PublicTrade(BaseModel):
+    """One print from the public trade tape. Prices are cents (possibly sub-penny)."""
+
+    ticker: str
+    created_time: datetime
+    yes_price_cents: float
+    no_price_cents: float
+    count: float
+    taker_side: Literal["yes", "no"]  # outcome the taker bought (the maker sold it / bought the other side)
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> PublicTrade:
+        yes = float(raw["yes_price_dollars"]) * 100 if "yes_price_dollars" in raw else float(raw["yes_price"])
+        no = float(raw["no_price_dollars"]) * 100 if "no_price_dollars" in raw else 100.0 - yes
+        return cls(
+            ticker=raw["ticker"],
+            created_time=raw["created_time"],
+            yes_price_cents=yes,
+            no_price_cents=no,
+            count=float(raw.get("count_fp", raw.get("count", 0)) or 0),
+            taker_side=raw.get("taker_outcome_side") or raw["taker_side"],
+        )
+
+
 class OrderResult(BaseModel):
     order_id: str
     client_order_id: str | None = None
@@ -347,10 +371,38 @@ class KalshiClient:
         body = await self._request("GET", "/portfolio/balance", params=params)
         return int(body["balance"])
 
-    async def get_series_exchange_index(self, series_ticker: str) -> int | None:
+    async def get_series(self, series_ticker: str) -> dict[str, Any]:
         body = await self._request("GET", f"/series/{series_ticker}", auth=self._signer is not None)
-        index = (body.get("series") or {}).get("exchange_index")
+        return body.get("series") or {}
+
+    async def get_series_exchange_index(self, series_ticker: str) -> int | None:
+        index = (await self.get_series(series_ticker)).get("exchange_index")
         return None if index is None else int(index)
+
+    async def get_trades(
+        self, ticker: str, *, min_ts: datetime, max_ts: datetime, page_limit: int = 1000, max_pages: int = 20
+    ) -> list[PublicTrade]:
+        """Public trade tape for one market between two times (oldest first)."""
+        trades: list[PublicTrade] = []
+        cursor: str | None = None
+        for _ in range(max_pages):
+            params: dict[str, Any] = {
+                "ticker": ticker, "min_ts": int(min_ts.timestamp()), "max_ts": int(max_ts.timestamp()) + 1,
+                "limit": page_limit,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            body = await self._request("GET", "/markets/trades", params=params, auth=False)
+            for raw in body.get("trades", []):
+                try:
+                    trades.append(PublicTrade.from_api(raw))
+                except (KeyError, ValueError) as exc:
+                    logger.debug("skipping unparseable trade on %s: %s", ticker, exc)
+            cursor = body.get("cursor") or None
+            if cursor is None:
+                break
+        trades.sort(key=lambda t: t.created_time)
+        return [t for t in trades if min_ts <= t.created_time <= max_ts]
 
     async def get_markets(
         self,

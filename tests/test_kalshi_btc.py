@@ -848,3 +848,59 @@ async def test_live_fill_details_fall_back_to_the_order_record(signer: KalshiReq
         client_fast = client
         result = await client_fast.submit_order(order)
     assert result.avg_fill_price_cents == pytest.approx(43.0) and result.fees_cents == 3
+
+
+# ---------------------------------------------------------------- maker experiment building blocks
+
+def test_public_trade_parses_fixed_point_tape() -> None:
+    from execution.kalshi_client import PublicTrade
+
+    t = PublicTrade.from_api({
+        "count_fp": "95.23", "created_time": "2026-10-10T01:06:16.637118Z", "no_price_dollars": "0.3000",
+        "taker_outcome_side": "no", "taker_side": "no", "ticker": "KXBTC15M-26OCT092115-15",
+        "yes_price_dollars": "0.7000",
+    })
+    assert (t.yes_price_cents, t.no_price_cents, t.count, t.taker_side) == (70.0, 30.0, 95.23, "no")
+    assert t.created_time.tzinfo is not None
+
+
+def test_maker_fee_only_on_series_that_charge_makers() -> None:
+    from services.risk_engine import kalshi_maker_fee_cents
+
+    assert kalshi_maker_fee_cents(1, 50, "quadratic") == 0
+    assert kalshi_maker_fee_cents(1, 50, None) == 0
+    assert kalshi_maker_fee_cents(1, 50, "quadratic_with_maker_fees") == 1  # ceil(0.4375c)
+    assert kalshi_maker_fee_cents(100, 50, "quadratic_with_maker_fees") == 44  # ceil(43.75c)
+
+
+def test_maker_limit_improves_or_joins_the_bid() -> None:
+    from services.maker_experiment import maker_limit, side_quotes
+
+    assert maker_limit(76, 80) == (77, False)
+    assert maker_limit(79, 80) == (79, True)  # 1c spread: join
+    assert maker_limit(None, 5) == (1, False)
+    assert maker_limit(0, 1) is None and maker_limit(None, 1) is None
+    assert side_quotes("yes", 76, 80) == (76, 80)
+    assert side_quotes("no", 76, 80) == (20, 24)
+
+
+def test_first_fill_needs_a_taker_selling_our_side_at_or_through_our_price() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from execution.kalshi_client import PublicTrade
+    from services.maker_experiment import first_fill
+
+    t0 = datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+    def trade(sec: int, yes: float, taker: str) -> PublicTrade:
+        return PublicTrade(ticker="T", created_time=t0 + timedelta(seconds=sec), yes_price_cents=yes,
+                           no_price_cents=100 - yes, count=1, taker_side=taker)
+
+    end = t0 + timedelta(seconds=180)
+    tape = [trade(-5, 70, "no"), trade(10, 80, "yes"), trade(20, 78, "no"), trade(30, 77, "no"), trade(40, 76, "no"), trade(200, 60, "no")]
+    assert first_fill("yes", 77, False, tape, t0, end) is tape[3]  # at our price, alone at the top
+    assert first_fill("yes", 77, True, tape, t0, end) is tape[4]  # joined the queue: needs a trade through
+    assert first_fill("yes", 75, False, tape, t0, end) is None  # 60c print came after the cancel
+    # A taker buying YES at 80c is selling NO at 20c: through a 23c NO bid. YES-bid prints never fill NO bids.
+    assert first_fill("no", 23, False, tape, t0, end) is tape[1]
+    assert first_fill("no", 19, False, tape, t0, end) is None

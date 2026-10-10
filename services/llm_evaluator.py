@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = os.environ.get("BTC15M_LLM_MODEL", "claude-sonnet-5-5")
 DEFAULT_EFFORT = os.environ.get("BTC15M_LLM_EFFORT", "medium")
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+# Models without server-side fallback: a fallback list returns 400 on them, so don't send one.
+_NO_SERVER_FALLBACK_PREFIXES = ("claude-haiku-5-5",)
 
 SYSTEM_PROMPT = """\
 You are the final risk gate for an automated trading system that buys Kalshi KXBTC15M \
@@ -136,6 +138,7 @@ class LLMEvaluator:
         self._client = client or AsyncAnthropic(timeout=timeout_sec, max_retries=2)
         self.model = model
         self.effort = effort
+        self.server_fallback = not model.startswith(_NO_SERVER_FALLBACK_PREFIXES)
 
     async def evaluate(self, candidate: FairValueOutput, context: dict[str, Any]) -> LLMVerdict:
         verdict, _ = await self.evaluate_with_usage(candidate, context)
@@ -147,11 +150,11 @@ class LLMEvaluator:
         """Like `evaluate`, plus billed token usage (None when no response was billed)."""
         model_p = candidate.model_probability
         try:
+            fallback: dict[str, Any] = {"betas": [FALLBACK_BETA], "fallbacks": "default"} if self.server_fallback else {}
             response = await self._client.beta.messages.parse(
                 model=self.model,
                 max_tokens=16000,
-                betas=[FALLBACK_BETA],
-                fallbacks="default",
+                **fallback,
                 # The static system prompt (plus the output schema) is identical on every call;
                 # cache it so repeat calls bill it at the cache-read rate.
                 system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],

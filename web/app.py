@@ -76,6 +76,7 @@ class DashboardState:
         self.stats: Optional[AgentStats] = None  # refreshed by the live trader
         self.activity: Optional[AgentActivity] = None
         self.evaluation: Optional[EvaluationReport] = None  # latest hourly evaluation
+        self.pricing: dict[str, Any] = {}  # which pricing model / market blend the agent is trading on
 
     def update_spot(self, tick: BtcSpotTick) -> None:
         self.spot = tick
@@ -207,6 +208,7 @@ def create_app(
             "activity": state.activity,
             "controls_ctx": controls_context(),
             "evaluation": state.evaluation,
+            "pricing": state.pricing,
         }
         return TEMPLATES.TemplateResponse(request, "index.html", context)
 
@@ -223,7 +225,9 @@ def create_app(
 
     @app.get("/partials/evaluation", response_class=HTMLResponse)
     async def evaluation_partial(request: Request) -> HTMLResponse:
-        return TEMPLATES.TemplateResponse(request, "partials/evaluation.html", {"evaluation": state.evaluation})
+        return TEMPLATES.TemplateResponse(
+            request, "partials/evaluation.html", {"evaluation": state.evaluation, "pricing": state.pricing}
+        )
 
     @app.get("/partials/controls", response_class=HTMLResponse)
     async def controls_partial(request: Request) -> HTMLResponse:

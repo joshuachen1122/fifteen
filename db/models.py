@@ -104,6 +104,9 @@ class EvaluationTraceRecord(SQLModel, table=True):
     llm_cache_read_tokens: Optional[int] = None
     llm_cache_write_tokens: Optional[int] = None
     llm_cost_usd: Optional[float] = None
+    # Exact LLM input ({"candidate": FairValueOutput, "context": {...}}) so decisions can be replayed
+    # through other models; null for decisions recorded before replays existed.
+    llm_input_json: Optional[str] = None
 
     is_paper: Optional[bool] = Field(default=None, index=True)  # mode at decision time; null = before modes
 
@@ -221,7 +224,11 @@ class MarketSnapshot(SQLModel, table=True):
     historical_volatility: float
     momentum_1m: float
     order_book_imbalance: float
-    model_probability: float  # P(YES) from the live pricing model with the parameters active at `ts`
+    model_probability: float  # P(YES) the agent traded on at `ts` (active model, after any market blend)
+    # Raw model probabilities, recorded side by side so the evaluation can compare them on the
+    # same contracts; null before the settlement-aware model existed (those rows are spot-only).
+    spot_model_probability: Optional[float] = None
+    settlement_model_probability: Optional[float] = None
 
 
 class ContractOutcome(SQLModel, table=True):
@@ -245,3 +252,49 @@ class EvaluationReportRecord(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     created_at: datetime = _utc_field(default_now=True, index=True)
     report_json: str
+
+
+class MakerShadowOrder(SQLModel, table=True):
+    """Hypothetical resting (maker) bid placed alongside an LLM-reviewed candidate. Never sent.
+
+    Resolved after `cancel_at` against Kalshi's public trade tape: a taker selling our side at or
+    below our price after we posted would have filled us. Compared with buying at the ask, this
+    measures the fee + spread saved and the adverse selection paid (fills skew toward losers).
+    """
+
+    __tablename__ = "maker_shadow_orders"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    created_at: datetime = _utc_field(default_now=True, index=True)
+    evaluation_id: Optional[int] = Field(default=None, foreign_key="evaluation_traces.id", index=True)
+    ticker: str = Field(index=True)
+    side: str  # "yes" | "no"
+    is_paper: bool
+    llm_should_bet: Optional[bool] = None
+    close_time: datetime = _utc_field()
+    cancel_at: datetime = _utc_field(index=True)
+    limit_cents: int  # resting bid on our side
+    joined_queue: bool  # True when the spread was 1c and we joined the best bid instead of improving it
+    taker_ask_cents: int  # what buying immediately would have cost
+    maker_fee_cents: int  # per contract, from the series' fee schedule
+    win_probability: float  # model/LLM P(our side wins) at posting
+    resolved_at: Optional[datetime] = _utc_field(nullable=True, index=True)
+    filled: Optional[bool] = None
+    filled_at: Optional[datetime] = _utc_field(nullable=True)
+    fill_trade_cents: Optional[float] = None  # price of the first trade that would have filled us
+
+
+class LLMReplayResult(SQLModel, table=True):
+    """A logged LLM decision re-asked through another model (cost/quality experiment)."""
+
+    __tablename__ = "llm_replays"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    created_at: datetime = _utc_field(default_now=True, index=True)
+    trace_id: int = Field(foreign_key="evaluation_traces.id", index=True)
+    model: str = Field(index=True)
+    effort: str
+    should_bet: bool
+    adjusted_probability: float
+    failed: bool = False  # fail-closed veto (API error, invalid output)
+    cost_usd: Optional[float] = None
