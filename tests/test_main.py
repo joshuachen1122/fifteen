@@ -121,11 +121,22 @@ GATED = {"llm_gate": True, "entry_max_seconds_remaining": 900}
 
 
 def make_agent(
-    db: Database, clock: Clock, evaluator: Any, close_in: timedelta = timedelta(minutes=10), **settings: Any
+    db: Database,
+    clock: Clock,
+    evaluator: Any,
+    close_in: timedelta = timedelta(minutes=10),
+    exchanges: Any = None,
+    **settings: Any,
 ) -> TradingAgent:
     client = SettlingClient()
     agent = TradingAgent(
-        Settings(web_enabled=False, **(GATED | settings)), db=db, client=client, feed=warm_feed(clock), evaluator=evaluator, clock=clock
+        Settings(web_enabled=False, **(GATED | settings)),
+        db=db,
+        client=client,
+        feed=warm_feed(clock),
+        evaluator=evaluator,
+        clock=clock,
+        exchanges=exchanges,
     )
     market = KalshiMarket(ticker=TICKER, strike_price=STRIKE, close_time=clock.now + close_in)
     book = OrderBook(TICKER)

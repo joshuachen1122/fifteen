@@ -207,7 +207,8 @@ class RuntimeSetting(SQLModel, table=True):
 
 
 class MarketSnapshot(SQLModel, table=True):
-    """Unconditional sample of a live contract (every few seconds), whether or not it showed an edge.
+    """Unconditional sample of a live contract, whether or not it showed an edge: every 5 seconds,
+    and every second in the final two minutes (the settlement average and the entry window).
 
     Paired with `ContractOutcome`, this is the unbiased dataset for calibration, model research
     and backtests; trades and evaluation traces only cover moments the scanner flagged.
@@ -235,6 +236,54 @@ class MarketSnapshot(SQLModel, table=True):
     # Coinbase-to-CF-Benchmarks gap added to spot (services/spot_calibration.py); null before the
     # correction existed, which also marks the older model generation for the evaluation.
     index_gap: Optional[float] = None
+    # Top of book in contracts and resting size within 5c of the best price (fill realism).
+    yes_bid_size: Optional[float] = None
+    yes_ask_size: Optional[float] = None  # = size of the best NO bid
+    bid_depth_5c: Optional[float] = None
+    ask_depth_5c: Optional[float] = None
+    # Median mid across the index exchanges we record (`IndexSample`), uncalibrated.
+    composite_spot: Optional[float] = None
+    # Inside the settlement window: mean of the (calibrated) spot seconds already in the average,
+    # and how many seconds that covers. These are the settlement model's observed inputs.
+    observed_average: Optional[float] = None
+    observed_seconds: Optional[int] = None
+
+
+class IndexSample(SQLModel, table=True):
+    """Mid price per index exchange (services/exchange_recorder.py): every 5 seconds, and every
+    second while a contract is in its final two minutes (each contract's settlement average,
+    which is also the next contract's strike average)."""
+
+    __tablename__ = "index_samples"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ts: datetime = _utc_field(index=True)
+    coinbase: Optional[float] = None
+    kraken: Optional[float] = None
+    bitstamp: Optional[float] = None
+    gemini: Optional[float] = None
+    cryptocom: Optional[float] = None
+    bullish: Optional[float] = None
+    composite: Optional[float] = None  # median of the fresh mids above
+    sources: int = 0
+
+
+class KalshiTapeBar(SQLModel, table=True):
+    """Public Kalshi trades aggregated into 1-second bars over each contract's final minutes
+    (a full contract prints ~30k trades, too many to keep raw)."""
+
+    __tablename__ = "kalshi_tape_bars"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    ticker: str = Field(index=True)
+    start: datetime = _utc_field(index=True)
+    seconds: int = 1
+    trades: int
+    volume: float  # contracts
+    taker_yes_volume: float  # contracts bought by YES takers
+    vwap_yes_cents: float
+    low_yes_cents: float
+    high_yes_cents: float
 
 
 class ContractOutcome(SQLModel, table=True):
@@ -248,6 +297,7 @@ class ContractOutcome(SQLModel, table=True):
     settled_yes: bool
     settlement_price: Optional[float] = None
     recorded_at: datetime = _utc_field(default_now=True)
+    tape_bars: Optional[int] = None  # KalshiTapeBar rows stored for it; null = tape not fetched yet
 
 
 class EvaluationReportRecord(SQLModel, table=True):

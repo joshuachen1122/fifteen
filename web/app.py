@@ -72,6 +72,7 @@ class DashboardState:
         self.activity: Optional[AgentActivity] = None
         self.evaluation: Optional[EvaluationReport] = None  # latest hourly evaluation
         self.pricing: dict[str, Any] = {}  # which pricing model / market blend the agent is trading on
+        self.data_health: dict[str, Any] = {}  # research-data recorder status (refreshed every minute)
 
     def update_spot(self, tick: BtcSpotTick) -> None:
         self.spot = tick
@@ -176,6 +177,7 @@ def create_app(
             "controls_ctx": controls_context(),
             "evaluation": state.evaluation,
             "pricing": state.pricing,
+            "data": state.data_health,
         }
         return TEMPLATES.TemplateResponse(request, "index.html", context)
 
@@ -239,6 +241,10 @@ def create_app(
     @app.get("/partials/markets", response_class=HTMLResponse)
     async def markets_partial(request: Request) -> HTMLResponse:
         return TEMPLATES.TemplateResponse(request, "partials/markets.html", {"markets_ctx": await markets_context()})
+
+    @app.get("/partials/data", response_class=HTMLResponse)
+    async def data_partial(request: Request) -> HTMLResponse:
+        return TEMPLATES.TemplateResponse(request, "partials/data.html", {"data": state.data_health})
 
     @app.get("/partials/backtest", response_class=HTMLResponse)
     async def backtest_partial(request: Request) -> HTMLResponse:

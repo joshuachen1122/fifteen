@@ -24,11 +24,13 @@ import json
 import logging
 import math
 import os
+import shutil
 import signal
 import sys
 from collections import Counter
 from collections.abc import Callable, Coroutine, Iterator
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 import uvicorn
@@ -47,6 +49,8 @@ from db.models import (
     ContractOutcome,
     EvaluationReportRecord,
     EvaluationTraceRecord,
+    IndexSample,
+    KalshiTapeBar,
     MakerShadowOrder,
     MarketSnapshot,
     RuntimeSetting,
@@ -62,8 +66,10 @@ from services.spot_calibration import CalibratedSpot, estimate_index_gap, gap_ob
 from services.btc_spot_feed import BtcSpotFeed
 from services.agent_stats import compute_activity, compute_stats
 from services.evaluation import EvaluationReport
+from services.exchange_recorder import ExchangeRecorder
 from services.llm_evaluator import LLMEvaluator, LLMUsage
 from services.maker_experiment import first_fill, maker_limit, side_quotes
+from services.market_tape import tape_bars
 from services.optimizer import load_active_parameters
 from services.risk_engine import (
     DAILY_DRAWDOWN_LIMIT,
@@ -139,6 +145,12 @@ class Settings(BaseSettings):
     # Settlement, research data & evaluation
     settlement_poll_sec: float = 180.0
     snapshot_interval_sec: float = 5.0  # unconditional market snapshots for research/backtests
+    # Research data is recorded every second while any contract is in its final `high_res_window_sec`
+    # (the settlement average, the entry window, and the next contract's strike average).
+    high_res_window_sec: int = 120
+    high_res_interval_sec: float = 1.0
+    exchange_recorder: bool = True  # record top of book from the CF Benchmarks index exchanges
+    tape_window_sec: int = 180  # store 1-second Kalshi tape bars over each contract's final minutes
     evaluation_interval_sec: float = 3600.0  # hourly report-only evaluation (separate process)
     evaluation_timeout_sec: float = 1200.0
     auto_apply_params: bool = True  # apply tuned parameters only when they win on held-out trades
@@ -168,8 +180,10 @@ class TradingAgent:
         evaluator: Optional[LLMEvaluator],
         dashboard: Optional[DashboardState] = None,
         clock: Callable[[], datetime] = _utc_now,
+        exchanges: Optional[ExchangeRecorder] = None,
     ) -> None:
         self.settings = settings
+        self.exchanges = exchanges  # record-only index exchange quotes (None disables)
         self.db = db
         self.client = client
         self.feed = feed
@@ -211,6 +225,7 @@ class TradingAgent:
         self._latest_tick: Optional[BtcSpotTick] = None
         self._last_dashboard_tick: Optional[datetime] = None
         self._snapshots: dict[str, MarketSnapshot] = {}  # latest per live contract, written every few seconds
+        self._snapshot_written: dict[str, datetime] = {}  # last write per contract
         self.pricing_model: PricingModel = "settlement" if settings.pricing_model == "settlement" else "spot"
         self.blend_weight = 1.0  # weight on the model vs the market mid (1.0 = no blend)
         self.pricing_reason = "default until the hourly evaluation has enough settled contracts"
@@ -540,21 +555,51 @@ class TradingAgent:
             "setting_blend": self.settings.market_blend,
         }
 
+    def high_res_now(self, now: Optional[datetime] = None) -> bool:
+        """True while any live contract is in its final `high_res_window_sec`."""
+        now = now or self._clock()
+        window = self.settings.high_res_window_sec
+        return any(0 < (m.close_time - now).total_seconds() <= window for m in self.scanner.markets.values())
+
     async def persist_spot_loop(self) -> None:
-        """Downsample spot ticks into SQLite so the backtester can replay volatility."""
+        """Downsample spot ticks and index-exchange quotes into SQLite for backtests and retraining."""
         last_saved: Optional[datetime] = None
+        last_index: Optional[datetime] = None
         while True:
-            await asyncio.sleep(self.settings.spot_persist_interval_sec)
-            tick = self._latest_tick
-            if tick is None or tick.timestamp == last_saved:
-                continue
+            await asyncio.sleep(self.settings.high_res_interval_sec)
             try:
-                async with self.db.session() as session:
-                    session.add(BtcPriceHistory(source=tick.source, price=tick.price, timestamp=tick.timestamp))
-                    await session.commit()
-                last_saved = tick.timestamp
+                last_saved, last_index = await self.persist_prices(last_saved, last_index)
             except Exception:
-                logger.exception("failed to persist spot tick")
+                logger.exception("failed to persist spot prices")
+
+    async def persist_prices(
+        self, last_saved: Optional[datetime], last_index: Optional[datetime]
+    ) -> tuple[Optional[datetime], Optional[datetime]]:
+        """One recorder step: write the spot tick and the index sample if they are due.
+        Returns the updated (last spot tick written, last index sample time)."""
+        now = self._clock()
+        due_every = 0.0 if self.high_res_now(now) else self.settings.spot_persist_interval_sec
+        rows: list[Any] = []
+        tick = self._latest_tick
+        if tick is not None and tick.timestamp != last_saved and (
+            last_saved is None or (tick.timestamp - last_saved).total_seconds() >= due_every
+        ):
+            rows.append(BtcPriceHistory(source=tick.source, price=tick.price, timestamp=tick.timestamp))
+            last_saved = tick.timestamp
+        if self.exchanges is not None and (
+            last_index is None or (now - last_index).total_seconds() >= max(due_every, 0.5)
+        ):
+            mids = self.exchanges.mids(now)
+            if mids:
+                rows.append(
+                    IndexSample(ts=now, composite=self.exchanges.composite(now), sources=len(mids), **mids)
+                )
+                last_index = now
+        if rows:
+            async with self.db.session() as session:
+                session.add_all(rows)
+                await session.commit()
+        return last_saved, last_index
 
     async def dashboard_loop(self) -> None:
         """Mirror scanner books into the state manager and dashboard."""
@@ -566,12 +611,48 @@ class TradingAgent:
             await asyncio.sleep(self.settings.dashboard_refresh_sec)
 
     async def stats_loop(self) -> None:
+        last_health: Optional[datetime] = None
         while True:
             try:
                 await self.refresh_stats()
+                if last_health is None or (self._clock() - last_health).total_seconds() >= 60:
+                    await self.refresh_data_health()
+                    last_health = self._clock()
             except Exception:
                 logger.exception("stats refresh failed")
             await asyncio.sleep(self.settings.stats_refresh_sec)
+
+    async def refresh_data_health(self) -> None:
+        """Row counts over the last hour, tape coverage and disk use, for the dashboard's data panel."""
+        now = self._clock()
+        hour = now - timedelta(hours=1)
+        async with self.db.session() as session:
+            counts = {
+                name: (await session.exec(select(func.count()).select_from(model).where(column >= hour))).one()
+                for name, model, column in (
+                    ("snapshots", MarketSnapshot, MarketSnapshot.ts),
+                    ("index_samples", IndexSample, IndexSample.ts),
+                    ("spot_prices", BtcPriceHistory, BtcPriceHistory.timestamp),
+                )
+            }
+            outcomes, taped = (
+                await session.exec(select(func.count(), func.count(col(ContractOutcome.tape_bars))))
+            ).one()
+        path = _sqlite_path(self.settings.database_url)
+        disk = shutil.disk_usage(path.parent) if path is not None and path.parent.exists() else None
+        self.dashboard.data_health = {
+            "last_hour": counts,
+            "outcomes": outcomes,
+            "taped": taped,
+            "exchanges": self.exchanges.status(now) if self.exchanges is not None else [],
+            "composite": self.exchanges.composite(now) if self.exchanges is not None else None,
+            "coinbase": self.feed.latest_price(),
+            "db_mb": path.stat().st_size / 1e6 if path is not None and path.exists() else None,
+            "disk_free_mb": disk.free / 1e6 if disk else None,
+            "disk_total_mb": disk.total / 1e6 if disk else None,
+            "high_res_window_sec": self.settings.high_res_window_sec,
+            "tape_window_sec": self.settings.tape_window_sec,
+        }
 
     async def refresh_stats(self) -> None:
         assert self.risk is not None
@@ -647,7 +728,17 @@ class TradingAgent:
                     spot_model_probability=values["spot"].model_probability,
                     settlement_model_probability=values["settlement"].model_probability,
                     index_gap=self.spot.index_gap,
+                    composite_spot=self.exchanges.composite() if self.exchanges is not None else None,
+                    **_book_fields(book),
+                    **self._observed_fields(state.seconds_remaining),
                 )
+
+    def _observed_fields(self, seconds_remaining: int) -> dict[str, Any]:
+        elapsed = SETTLEMENT_WINDOW_SEC - seconds_remaining
+        observed = self.spot.observed_prices(elapsed - 1) if elapsed > 0 else []
+        if not observed:
+            return {}
+        return {"observed_average": sum(observed) / len(observed), "observed_seconds": len(observed)}
 
     # -- decision pipeline -----------------------------------------------------
 
@@ -1106,6 +1197,7 @@ class TradingAgent:
         await self.refresh_spot_calibration()
         await self.settle_completed()
         await self.record_contract_outcomes()
+        await self.record_tapes()
         await self.resolve_maker_shadows()
         await self.load_latest_evaluation()  # also shows reports from manual runs
         # Parameters change only via the hourly held-out evaluation or the dashboard's optimizer.
@@ -1115,20 +1207,28 @@ class TradingAgent:
 
     async def snapshot_loop(self) -> None:
         while True:
-            await asyncio.sleep(self.settings.snapshot_interval_sec)
+            await asyncio.sleep(self.settings.high_res_interval_sec)
             try:
                 await self.write_snapshots()
             except Exception:
                 logger.exception("failed to write market snapshots")
 
     async def write_snapshots(self) -> int:
-        """Persist the latest sample of each live contract (skips stale ones)."""
-        now = self._clock()
-        fresh = [
-            s for s in self._snapshots.values()
-            if (now - s.ts).total_seconds() <= 2 * self.settings.snapshot_interval_sec and s.close_time > now
-        ]
+        """Persist the latest sample of each live contract when due: every `snapshot_interval_sec`,
+        or every call inside its final `high_res_window_sec`. Stale samples are skipped."""
+        s, now = self.settings, self._clock()
+        fresh = []
+        for snap in self._snapshots.values():
+            if (now - snap.ts).total_seconds() > 2 * s.snapshot_interval_sec or snap.close_time <= now:
+                continue
+            last = self._snapshot_written.get(snap.ticker)
+            high_res = (snap.close_time - now).total_seconds() <= s.high_res_window_sec
+            if last is None or high_res or (now - last).total_seconds() >= s.snapshot_interval_sec - 0.5:
+                fresh.append(snap)
+                self._snapshot_written[snap.ticker] = now
         self._snapshots.clear()
+        for ticker in [t for t in self._snapshot_written if t not in self.scanner.markets]:
+            del self._snapshot_written[ticker]
         if fresh:
             async with self.db.session() as session:
                 session.add_all(fresh)
@@ -1157,6 +1257,38 @@ class TradingAgent:
                 continue
             recorded += await self._store_outcome(market)
         return recorded
+
+    async def record_tapes(self, limit: int = 4) -> int:
+        """Store 1-second Kalshi tape bars over the final minutes of settled contracts (oldest first,
+        so a backlog is worked through a few contracts per poll)."""
+        async with self.db.session() as session:
+            pending = (
+                await session.exec(
+                    select(ContractOutcome)
+                    .where(col(ContractOutcome.tape_bars).is_(None))
+                    .order_by(col(ContractOutcome.close_time))
+                    .limit(limit)
+                )
+            ).all()
+        stored = 0
+        for outcome in pending:
+            end = outcome.close_time
+            start = end - timedelta(seconds=self.settings.tape_window_sec)
+            try:
+                trades = await self.client.get_trades(outcome.ticker, min_ts=start, max_ts=end, max_pages=40)
+            except KalshiAPIError as exc:
+                logger.warning("could not fetch the tape for %s: %s", outcome.ticker, exc)
+                continue
+            bars = tape_bars(outcome.ticker, trades, start, end)
+            async with self.db.session() as session:
+                session.add_all(bars)
+                row = await session.get(ContractOutcome, outcome.ticker)
+                if row is not None:
+                    row.tape_bars = len(bars)
+                    session.add(row)
+                await session.commit()
+            stored += 1
+        return stored
 
     async def _store_outcome(self, market: KalshiMarket) -> int:
         if market.result not in ("yes", "no"):
@@ -1309,14 +1441,37 @@ class TradingAgent:
             asyncio.create_task(self.settlement_loop(), name="settlement-poller"),
             asyncio.create_task(self.snapshot_loop(), name="market-snapshots"),
             asyncio.create_task(self.evaluation_loop(), name="hourly-evaluation"),
+            *([self.exchanges.start()] if self.exchanges is not None else []),
         ]
 
     async def shutdown(self) -> None:
         self.scanner.stop()
         await self.feed.stop()
+        if self.exchanges is not None:
+            await self.exchanges.stop()
         for task in list(self._handlers):
             task.cancel()
         await asyncio.gather(*self._handlers, return_exceptions=True)
+
+
+def _sqlite_path(url: str) -> Optional[Path]:
+    if not url.startswith("sqlite") or ":memory:" in url or ":///" not in url:
+        return None
+    return Path(url.split(":///", 1)[1])
+
+
+def _book_fields(book: Any) -> dict[str, Any]:
+    """Top-of-book sizes and resting size within 5c of the best price on each side (contracts)."""
+    bid, ask = book.best_yes_bid, book.best_yes_ask
+    if bid is None or ask is None:
+        return {}
+    no_bid = 100 - ask
+    return {
+        "yes_bid_size": book.yes_bids.get(bid),
+        "yes_ask_size": book.no_bids.get(no_bid),
+        "bid_depth_5c": sum(size for price, size in book.yes_bids.items() if price > bid - 5),
+        "ask_depth_5c": sum(size for price, size in book.no_bids.items() if price > no_bid - 5),
+    }
 
 
 def _model_verdict(c: ScanCandidate) -> LLMVerdict:
@@ -1375,7 +1530,8 @@ async def run(settings: Settings) -> None:
         logger.error("ANTHROPIC_API_KEY is not set: every candidate will be vetoed")
     if not client.ws_auth_headers():
         logger.error("Kalshi credentials are not set: the order-book WebSocket requires them, even for paper trading")
-    agent = TradingAgent(settings, db=db, client=client, feed=feed, evaluator=evaluator)
+    exchanges = ExchangeRecorder() if settings.exchange_recorder else None
+    agent = TradingAgent(settings, db=db, client=client, feed=feed, evaluator=evaluator, exchanges=exchanges)
     await agent.load_controls()
     await agent.restore()
     logger.warning(
@@ -1408,6 +1564,7 @@ async def run(settings: Settings) -> None:
                 "max_trade_usd": agent.max_trade_cents / 100,
                 "max_daily_trade_usd": agent.max_daily_cents / 100,
                 "spent_today_usd": agent.risk.spent_today_cents / 100 if agent.risk else None,
+                "index_exchanges_fresh": len(exchanges.mids()) if exchanges else None,
             }
 
         server = _Server(uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning"))

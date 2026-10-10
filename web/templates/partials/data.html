@@ -1,0 +1,36 @@
+{% set d = data %}
+<section id="data-panel" class="panel" hx-get="/partials/data" hx-trigger="every 60s" hx-swap="outerHTML">
+  <h2>Research data recorder</h2>
+  {% if not d %}
+    <div class="empty">Collecting…</div>
+  {% else %}
+  {% set h = d.last_hour %}
+  <div class="muted" style="margin-bottom: 8px;">Last hour: {{ "{:,}".format(h.snapshots) }} market snapshots ·
+    {{ "{:,}".format(h.index_samples) }} index samples · {{ "{:,}".format(h.spot_prices) }} Coinbase prices.
+    Every second in each contract's final {{ d.high_res_window_sec }}s, every 5s otherwise.</div>
+  <div class="muted" style="margin-bottom: 8px;">Kalshi tape: {{ d.taped }} of {{ d.outcomes }} settled contracts stored
+    (1-second bars over the final {{ d.tape_window_sec // 60 }} minutes).
+    {% if d.db_mb is not none %}Database {{ "%.0f" | format(d.db_mb) }} MB{% if d.disk_free_mb %}, {{ "%.0f" | format(d.disk_free_mb) }} MB free of {{ "%.0f" | format(d.disk_total_mb) }} MB{% endif %}.{% endif %}</div>
+  {% if d.exchanges %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>Index exchange</th><th>Status</th><th>Mid</th><th>vs composite</th><th>Reconnects</th></tr></thead>
+    <tbody>
+      {% for x in d.exchanges %}
+      <tr><td>{{ x.source }}</td>
+        <td>{% if x.fresh %}<span class="pill good">live</span>{% elif x.connected %}<span class="pill warning">stale</span>{% else %}<span class="pill critical">down</span>{% endif %}</td>
+        <td>{% if x.mid %}${{ "{:,.2f}".format(x.mid) }}{% else %}—{% endif %}</td>
+        <td>{% if x.mid and d.composite %}{{ "%+.2f" | format(x.mid - d.composite) }}{% else %}—{% endif %}</td>
+        <td>{{ x.reconnects }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% if d.composite and d.coinbase %}<div class="muted" style="margin-top: 6px;">Composite (median) ${{ "{:,.2f}".format(d.composite) }}: {{ "%+.2f" | format(d.composite - d.coinbase) }} vs the Coinbase trade feed the model prices from.</div>{% endif %}
+  {% endif %}
+  <details>
+    <summary>Retraining</summary>
+    <div class="muted" style="margin-top: 6px;">Run <code>python -m scripts.export_dataset --pull</code> locally: it copies this
+      database and writes one labelled row per snapshot (book, sizes, model inputs, index-exchange mids, Kalshi tape)
+      plus the raw tables to <code>data/</code>.</div>
+  </details>
+  {% endif %}
+</section>
