@@ -1258,9 +1258,10 @@ class TradingAgent:
             recorded += await self._store_outcome(market)
         return recorded
 
-    async def record_tapes(self, limit: int = 4) -> int:
+    async def record_tapes(self, limit: int = 2, page_delay_sec: float = 0.5) -> int:
         """Store 1-second Kalshi tape bars over the final minutes of settled contracts (oldest first,
-        so a backlog is worked through a few contracts per poll)."""
+        so a backlog is worked through a few contracts per poll). Pages are paced and the poll stops at
+        the first error: this is background data and must never get trading requests rate-limited."""
         async with self.db.session() as session:
             pending = (
                 await session.exec(
@@ -1275,10 +1276,12 @@ class TradingAgent:
             end = outcome.close_time
             start = end - timedelta(seconds=self.settings.tape_window_sec)
             try:
-                trades = await self.client.get_trades(outcome.ticker, min_ts=start, max_ts=end, max_pages=40)
+                trades = await self.client.get_trades(
+                    outcome.ticker, min_ts=start, max_ts=end, max_pages=40, page_delay_sec=page_delay_sec
+                )
             except KalshiAPIError as exc:
-                logger.warning("could not fetch the tape for %s: %s", outcome.ticker, exc)
-                continue
+                logger.warning("could not fetch the tape for %s (retrying next poll): %s", outcome.ticker, exc)
+                break
             bars = tape_bars(outcome.ticker, trades, start, end)
             async with self.db.session() as session:
                 session.add_all(bars)

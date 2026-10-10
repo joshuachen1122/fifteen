@@ -380,12 +380,22 @@ class KalshiClient:
         return None if index is None else int(index)
 
     async def get_trades(
-        self, ticker: str, *, min_ts: datetime, max_ts: datetime, page_limit: int = 1000, max_pages: int = 20
+        self,
+        ticker: str,
+        *,
+        min_ts: datetime,
+        max_ts: datetime,
+        page_limit: int = 1000,
+        max_pages: int = 20,
+        page_delay_sec: float = 0.0,
     ) -> list[PublicTrade]:
-        """Public trade tape for one market between two times (oldest first)."""
+        """Public trade tape for one market between two times (oldest first). `page_delay_sec`
+        paces background bulk reads so they never crowd out trading requests."""
         trades: list[PublicTrade] = []
         cursor: str | None = None
-        for _ in range(max_pages):
+        for page in range(max_pages):
+            if page and page_delay_sec > 0:
+                await asyncio.sleep(page_delay_sec)
             params: dict[str, Any] = {
                 "ticker": ticker, "min_ts": int(min_ts.timestamp()), "max_ts": int(max_ts.timestamp()) + 1,
                 "limit": page_limit,
