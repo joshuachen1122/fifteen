@@ -243,7 +243,34 @@ async def test_settlement_window_trades_on_the_model_and_asks_the_llm_in_shadow(
         activity = (await http.get("/partials/activity")).text
         evaluation = (await http.get("/partials/evaluation")).text
     assert "✓ traded" in activity and "LLM shadow: would veto" in activity and "✕ vetoed" not in activity
-    assert "final 60s only" in evaluation and "LLM in shadow" in evaluation
+    assert "final 60s only" in evaluation and "LLM in shadow" in evaluation and "under 20¢" in evaluation
+
+
+async def test_never_buys_a_side_below_the_price_floor(db: Database) -> None:
+    assert Settings().min_entry_price_cents == 20
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator(), min_entry_price_cents=YES_ASK + 1)
+    await agent.restore()
+
+    await agent.handle_candidate(yes_candidate(agent))  # an 80c YES under an 81c floor
+
+    assert await trade_rows(db) == [] and agent.evaluator.calls == []  # type: ignore[union-attr]
+
+
+async def test_price_floor_rechecks_the_ask_at_execution(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.restore()
+    candidate = yes_candidate(agent)  # 80c when detected
+    agent.scanner.books[TICKER].apply_snapshot({"yes": [[10, 100]], "no": [[85, 120]]}, clock.now)  # now 15c
+
+    await agent.handle_candidate(candidate)
+
+    [row] = await trade_rows(db)
+    assert row.side is None and row.status == "skipped" and row.filled_count == 0
+    async with db.session() as s:
+        trace = (await s.exec(select(EvaluationTraceRecord))).one()
+    assert trace.decision == "skip" and trace.skip_reason == "below_price_floor 15c < 20c"
 
 
 async def test_paper_ignores_the_drawdown_kill_switch(db: Database) -> None:

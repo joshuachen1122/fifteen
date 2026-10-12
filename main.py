@@ -119,6 +119,10 @@ class Settings(BaseSettings):
     # in shadow, so its verdicts are still scored without adding seconds of latency to late entries.
     llm_gate: bool = False
     model_only_cooldown_sec: float = 5.0  # re-evaluation gap per ticker/side when no LLM call gates it
+    # Never buy a side cheaper than this. The model overrates longshots: in the first 60 final-minute
+    # paper trades, the 18 bought at 10c or less all lost, and the replay with a 20c floor made
+    # +10c/contract vs +5c without one (scripts/backtest_final_minute.py).
+    min_entry_price_cents: int = 20
 
     # Pricing. "auto" follows the hourly evaluation once it has `model_min_contracts` settled
     # contracts of evidence; until then the agent trades the spot model without a market blend.
@@ -550,6 +554,7 @@ class TradingAgent:
             "paper_market_blend": self.settings.paper_market_blend,
             "entry_max_seconds": self.settings.entry_max_seconds_remaining,
             "llm_gate": self.settings.llm_gate,
+            "min_entry_price": self.settings.min_entry_price_cents,
             "reason": self.pricing_reason,
             "setting_model": self.settings.pricing_model,
             "setting_blend": self.settings.market_blend,
@@ -758,6 +763,8 @@ class TradingAgent:
         ticker, now, s = candidate.ticker, self._clock(), self.settings
         if candidate.market_state.seconds_remaining > s.entry_max_seconds_remaining:
             return
+        if candidate.ask_cents < s.min_entry_price_cents:
+            return
         if ticker in self._inflight or self._has_position(ticker):
             return
         cooldown = s.llm_cooldown_sec if s.llm_gate else s.model_only_cooldown_sec
@@ -822,6 +829,8 @@ class TradingAgent:
             skip_reason = "book_empty"
         elif (market.close_time - now).total_seconds() < MIN_ENTRY_SECONDS:
             skip_reason = "entry_window_closed"
+        elif ask < self.settings.min_entry_price_cents:
+            skip_reason = f"below_price_floor {ask}c < {self.settings.min_entry_price_cents}c"
         elif p_win - ask / 100 <= params.min_gross_edge:
             skip_reason = f"edge_after_llm {p_win - ask / 100:.4f} <= {params.min_gross_edge:.4f} at {ask}c"
         else:
