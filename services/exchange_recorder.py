@@ -364,7 +364,9 @@ class ExchangeRecorder:
         books = {
             name: book
             for name, book in self.books.items()
-            if (now - self.updated_at[name]).total_seconds() <= QUOTE_MAX_AGE_SEC and book.best() is not None
+            if (updated := self.updated_at.get(name)) is not None  # connected, no message yet
+            and (now - updated).total_seconds() <= QUOTE_MAX_AGE_SEC
+            and book.best() is not None
         }
         if len(books) < 3:
             return books

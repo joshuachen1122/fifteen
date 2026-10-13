@@ -131,6 +131,9 @@ def test_recorder_samples_every_index_proxy() -> None:
     assert sample["kraken_depth"] == 83_005.0
     assert sample["brti_estimate"] is not None
 
+    rec.books["cryptocom"] = Book()  # just connected: no message (and no timestamp) yet
+    assert rec.sample()["sources"] == 3 and {x["source"]: x["fresh"] for x in rec.status()}["cryptocom"] is False
+
 
 def test_composite_is_the_median_of_fresh_mids() -> None:
     clock = Clock(T0)
