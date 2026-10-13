@@ -40,6 +40,7 @@ class TradingControls(Protocol):
     def controls_state(self) -> dict[str, Any]: ...
     async def switch_mode(self, live: bool) -> None: ...
     async def set_limits(self, max_trade_usd: float, max_daily_trade_usd: float) -> None: ...
+    async def set_agent_enabled(self, enabled: bool) -> None: ...
 
 
 UNAUTHENTICATED_PATHS = {"/healthz"}  # Fly health checks
@@ -214,6 +215,21 @@ def create_app(
         except ValueError as exc:
             return controls_response(request, error=str(exc))
         return controls_response(request, notice=f"Switched to {mode.upper()} trading.")
+
+    @app.post("/controls/agent", response_class=HTMLResponse)
+    async def set_agent(request: Request) -> HTMLResponse:
+        if controls is None or not password:
+            return controls_response(request, error="Set DASHBOARD_PASSWORD to enable dashboard controls.")
+        action = (await form(request)).get("action")
+        if action not in ("stop", "resume"):
+            return controls_response(request, error=f"Unknown action {action!r}.")
+        try:
+            await controls.set_agent_enabled(action == "resume")
+        except ValueError as exc:
+            return controls_response(request, error=str(exc))
+        if action == "stop":
+            return controls_response(request, notice="Agent stopped: no new trades and no LLM calls.")
+        return controls_response(request, notice="Agent resumed.")
 
     @app.post("/controls/limits", response_class=HTMLResponse)
     async def set_limits(request: Request) -> HTMLResponse:

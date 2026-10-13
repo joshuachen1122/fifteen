@@ -3,6 +3,9 @@
 <section id="controls-panel" class="panel wide controls" hx-get="/partials/controls" hx-trigger="every 10s" hx-swap="outerHTML">
   <h2>Trading controls</h2>
   <div class="toolbar">
+    {% if not c.agent_enabled %}
+      <span class="pill critical">■ STOPPED · {{ c.agent_stopped_by }}</span>
+    {% endif %}
     {% if c.mode == "live" %}
       <span class="pill critical">● LIVE · real money{% if c.exchange_index is not none %} · Kalshi exchange {{ c.exchange_index }}{% endif %}</span>
     {% else %}
@@ -24,6 +27,19 @@
   {% if c.notice %}<div class="delta-up" style="margin-bottom: 10px;">✓ {{ c.notice }}</div>{% endif %}
 
   {% if c.editable %}
+  <div class="toolbar" style="margin-bottom: 10px;">
+    {% if c.agent_enabled %}
+      <button type="button" class="danger" hx-post="/controls/agent" hx-vals='{"action": "stop"}' hx-target="#controls-panel" hx-swap="outerHTML"
+              hx-confirm="Stop the agent? No new trades and no LLM calls until you resume. Market data keeps recording and open positions still settle.">■ Stop agent</button>
+      <span class="muted">Kill switch: stops all trading and every LLM call.</span>
+    {% elif c.agent_resumable %}
+      <button type="button" hx-post="/controls/agent" hx-vals='{"action": "resume"}' hx-target="#controls-panel" hx-swap="outerHTML">▶ Resume agent</button>
+      <span class="muted">Stopped: no trades and no LLM calls. Market data is still recorded and open positions still settle.</span>
+    {% else %}
+      <button type="button" disabled title="{{ c.agent_stopped_by }}">▶ Resume agent</button>
+      <span class="muted">Forced off by {{ c.agent_stopped_by }}.</span>
+    {% endif %}
+  </div>
   <form hx-post="/controls/limits" hx-target="#controls-panel" hx-swap="outerHTML">
     <label>Live max per trade (USD)<input name="max_trade_usd" type="number" min="0.01" step="0.01" value="{{ '%.2f' | format(c.max_trade_usd) }}"></label>
     <label>Live max per day (USD)<input name="max_daily_trade_usd" type="number" min="0.01" step="0.01" value="{{ '%.2f' | format(c.max_daily_trade_usd) }}"></label>

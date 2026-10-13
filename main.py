@@ -112,6 +112,10 @@ class Settings(BaseSettings):
     max_plausible_edge: float = 0.30  # larger "edges" are almost always bad quotes, not mispricing
     llm_daily_budget_usd: float = 5.0  # hard cap; past it no LLM calls (and no trades when the LLM gates them)
 
+    # Kill switch. The dashboard's Stop/Resume button persists across restarts; AGENT_ENABLED=false
+    # on the server forces the agent off regardless (for when the dashboard is unreachable).
+    agent_enabled: bool = True
+
     # Entries. Replays of the recorded snapshots found the model loses to the market until the
     # 60-second settlement average starts and beats it afterwards, so only enter in that final stretch.
     entry_max_seconds_remaining: int = 60  # 900 trades the whole window
@@ -232,6 +236,7 @@ class TradingAgent:
         self._snapshot_written: dict[str, datetime] = {}  # last write per contract
         self.pricing_model: PricingModel = "settlement" if settings.pricing_model == "settlement" else "spot"
         self.blend_weight = 1.0  # weight on the model vs the market mid (1.0 = no blend)
+        self.agent_enabled = settings.agent_enabled  # False: no trades and no LLM calls (data keeps recording)
         self.pricing_reason = "default until the hourly evaluation has enough settled contracts"
         self.fee_type: Optional[str] = None  # series fee schedule ("quadratic" = no maker fees)
         self._publish_pricing()
@@ -384,6 +389,25 @@ class TradingAgent:
             logger.error("live trading requested but blocked (%s); staying in PAPER mode", reason)
             live = False
         self.client.trading_enabled = live
+        self.agent_enabled = self.settings.agent_enabled and saved.get("agent_enabled", "true") == "true"
+        if not self.agent_enabled:
+            logger.warning("agent is STOPPED (%s): no trades and no LLM calls", self.agent_stopped_by)
+
+    @property
+    def agent_stopped_by(self) -> Optional[str]:
+        if not self.settings.agent_enabled:
+            return "AGENT_ENABLED=false on the server"
+        return None if self.agent_enabled else "stopped from the dashboard"
+
+    async def set_agent_enabled(self, enabled: bool) -> None:
+        """The kill switch: stop or resume trading and every LLM call. Market data, snapshots and
+        settlement of positions already open keep running, so nothing is lost while stopped."""
+        if enabled and not self.settings.agent_enabled:
+            raise ValueError("cannot resume: AGENT_ENABLED=false is set on the server")
+        async with self._order_lock:  # an order being sized or sent finishes first; none start after
+            self.agent_enabled = enabled
+            await self._save_setting("agent_enabled", "true" if enabled else "false")
+        logger.warning("agent %s from the dashboard", "RESUMED" if enabled else "STOPPED: no trades, no LLM calls")
 
     async def _save_setting(self, key: str, value: str) -> None:
         async with self.db.session() as session:
@@ -431,6 +455,9 @@ class TradingAgent:
             "remaining_today_usd": None if remaining is None else remaining / 100,
             "cash_usd": (self.risk.cash_cents / 100) if self.risk else None,
             "exchange_index": self.exchange_index,
+            "agent_enabled": self.agent_enabled,
+            "agent_stopped_by": self.agent_stopped_by,
+            "agent_resumable": self.settings.agent_enabled,
         }
 
     async def reload_parameters(self) -> None:
@@ -761,6 +788,8 @@ class TradingAgent:
 
     async def handle_candidate(self, candidate: ScanCandidate) -> None:
         ticker, now, s = candidate.ticker, self._clock(), self.settings
+        if not self.agent_enabled:
+            return
         if candidate.market_state.seconds_remaining > s.entry_max_seconds_remaining:
             return
         if candidate.ask_cents < s.min_entry_price_cents:
@@ -835,21 +864,24 @@ class TradingAgent:
             skip_reason = f"edge_after_llm {p_win - ask / 100:.4f} <= {params.min_gross_edge:.4f} at {ask}c"
         else:
             async with self._order_lock:
-                order = self.risk.size_order(
-                    c.fair_value,
-                    c.side,
-                    ask,
-                    params,
-                    probability_override=verdict.adjusted_probability,
-                    now=now,
-                    reasoning=verdict.reasoning,
-                )
-                if order is None:
-                    skip_reason = "risk_engine_no_size"
+                if not self.agent_enabled:  # stopped while the LLM was thinking
+                    skip_reason = "agent_stopped"
                 else:
-                    result, position = await self._execute(order, ask, now)
-                    if position is None:
-                        skip_reason = "order_not_filled"
+                    order = self.risk.size_order(
+                        c.fair_value,
+                        c.side,
+                        ask,
+                        params,
+                        probability_override=verdict.adjusted_probability,
+                        now=now,
+                        reasoning=verdict.reasoning,
+                    )
+                    if order is None:
+                        skip_reason = "risk_engine_no_size"
+                    else:
+                        result, position = await self._execute(order, ask, now)
+                        if position is None:
+                            skip_reason = "order_not_filled"
 
         llm_input = json.dumps({"candidate": c.fair_value.model_dump(mode="json"), "context": context}, default=str)
         if gated:
@@ -869,7 +901,7 @@ class TradingAgent:
         never acted on. Spend limits still apply.
         """
         s, now = self.settings, self._clock()
-        if self.evaluator is None or self._llm_calls[c.ticker] >= s.llm_max_calls_per_market:
+        if not self.agent_enabled or self.evaluator is None or self._llm_calls[c.ticker] >= s.llm_max_calls_per_market:
             return
         if self.llm_spend_today(now) >= s.llm_daily_budget_usd:
             return
@@ -1339,7 +1371,8 @@ class TradingAgent:
             "MODEL_MIN_CONTRACTS": str(self.settings.model_min_contracts),
             "LLM_REPLAY_MODEL": self.settings.llm_replay_model,
             "LLM_REPLAY_EFFORT": self.settings.llm_replay_effort,
-            "LLM_REPLAY_DAILY_USD": str(self.settings.llm_replay_daily_usd),
+            # Stopped: the report still runs (no LLM), but the LLM replays do not.
+            "LLM_REPLAY_DAILY_USD": str(self.settings.llm_replay_daily_usd if self.agent_enabled else 0),
         }
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "services.evaluation",
@@ -1577,6 +1610,7 @@ async def run(settings: Settings) -> None:
                 "max_daily_trade_usd": agent.max_daily_cents / 100,
                 "spent_today_usd": agent.risk.spent_today_cents / 100 if agent.risk else None,
                 "index_exchanges_fresh": len(exchanges.mids()) if exchanges else None,
+                "agent_enabled": agent.agent_enabled,
             }
 
         server = _Server(uvicorn.Config(app, host=settings.host, port=settings.port, log_level="warning"))

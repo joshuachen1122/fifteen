@@ -273,6 +273,81 @@ async def test_price_floor_rechecks_the_ask_at_execution(db: Database) -> None:
     assert trace.decision == "skip" and trace.skip_reason == "below_price_floor 15c < 20c"
 
 
+async def test_stopped_agent_neither_trades_nor_calls_the_llm_and_stays_stopped(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.load_controls()
+    await agent.restore()
+    await agent.set_agent_enabled(False)
+    candidate = yes_candidate(agent)
+
+    await agent.handle_candidate(candidate)
+    await agent._shadow_llm(1, candidate, {})
+
+    assert await trade_rows(db) == [] and agent.evaluator.calls == []  # type: ignore[union-attr]
+    assert agent.controls_state()["agent_stopped_by"] == "stopped from the dashboard"
+
+    restarted = make_agent(db, clock, FakeEvaluator())
+    await restarted.load_controls()
+    assert not restarted.agent_enabled
+    await restarted.restore()
+    await restarted.set_agent_enabled(True)
+    await restarted.handle_candidate(yes_candidate(restarted))
+    [row] = await trade_rows(db)
+    assert row.status == "filled"
+
+
+async def test_server_setting_forces_the_agent_off(db: Database) -> None:
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator(), agent_enabled=False)
+    await agent.load_controls()  # nothing persisted: the dashboard default would be "on"
+    assert not agent.agent_enabled
+    assert agent.controls_state()["agent_stopped_by"] == "AGENT_ENABLED=false on the server"
+    with pytest.raises(ValueError):
+        await agent.set_agent_enabled(True)
+
+
+async def test_stopping_while_the_llm_thinks_blocks_the_order(db: Database) -> None:
+    class StoppingEvaluator(FakeEvaluator):
+        async def evaluate_with_usage(self, candidate: FairValueOutput, context: dict[str, Any]) -> tuple[LLMVerdict, LLMUsage]:
+            await agent.set_agent_enabled(False)
+            return await super().evaluate_with_usage(candidate, context)
+
+    clock = Clock(T0)
+    agent = make_agent(db, clock, StoppingEvaluator())
+    await agent.restore()
+
+    await agent.handle_candidate(yes_candidate(agent))
+
+    [row] = await trade_rows(db)
+    assert row.status == "skipped" and row.filled_count == 0
+    async with db.session() as s:
+        trace = (await s.exec(select(EvaluationTraceRecord))).one()
+    assert trace.skip_reason == "agent_stopped"
+
+
+async def test_dashboard_kill_switch(db: Database) -> None:
+    import httpx
+
+    from web.app import create_app
+
+    clock = Clock(T0)
+    agent = make_agent(db, clock, FakeEvaluator())
+    await agent.restore()
+    app = create_app(agent.dashboard, db.engine, controls=agent, password="s3cret")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as anon:
+        assert (await anon.post("/controls/agent", data={"action": "stop"})).status_code == 401
+    assert agent.agent_enabled
+    async with httpx.AsyncClient(transport=transport, base_url="http://t", auth=("me", "s3cret")) as http:
+        assert "Stop agent" in (await http.get("/")).text
+        stopped = await http.post("/controls/agent", data={"action": "stop"})
+        assert "Agent stopped" in stopped.text and "STOPPED" in stopped.text and "Resume agent" in stopped.text
+        assert not agent.agent_enabled
+        resumed = await http.post("/controls/agent", data={"action": "resume"})
+        assert "Agent resumed" in resumed.text and agent.agent_enabled
+
+
 async def test_paper_ignores_the_drawdown_kill_switch(db: Database) -> None:
     clock = Clock(T0)
     agent = make_agent(db, clock, FakeEvaluator())
