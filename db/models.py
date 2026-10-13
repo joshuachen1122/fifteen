@@ -250,21 +250,32 @@ class MarketSnapshot(SQLModel, table=True):
 
 
 class IndexSample(SQLModel, table=True):
-    """Mid price per index exchange (services/exchange_recorder.py): every 5 seconds, and every
-    second while a contract is in its final two minutes (each contract's settlement average,
-    which is also the next contract's strike average)."""
+    """Index-exchange order books reduced to proxies for the CF Benchmarks index
+    (services/exchange_recorder.py): every 5 seconds, and every second while a contract is in its
+    final two minutes (each contract's settlement average, which is also the next one's strike).
+
+    Before 2026-10-13 ~21:00 UTC the venue mids came from ticker channels that lagged by 1-3 s and
+    the depth / estimate columns are null."""
 
     __tablename__ = "index_samples"
 
     id: Optional[int] = Field(default=None, primary_key=True)
     ts: datetime = _utc_field(index=True)
-    coinbase: Optional[float] = None
+    coinbase: Optional[float] = None  # best bid/ask mid per venue
     kraken: Optional[float] = None
     bitstamp: Optional[float] = None
     gemini: Optional[float] = None
     cryptocom: Optional[float] = None
     bullish: Optional[float] = None
-    composite: Optional[float] = None  # median of the fresh mids above
+    coinbase_depth: Optional[float] = None  # mid of the VWAPs to buy and to sell 1 BTC
+    kraken_depth: Optional[float] = None
+    bitstamp_depth: Optional[float] = None
+    gemini_depth: Optional[float] = None
+    cryptocom_depth: Optional[float] = None
+    bullish_depth: Optional[float] = None
+    composite: Optional[float] = None  # median of the fresh venue mids
+    depth_composite: Optional[float] = None  # median of the fresh venue depth mids
+    brti_estimate: Optional[float] = None  # the BRTI calculation on the consolidated visible books
     sources: int = 0
 
 

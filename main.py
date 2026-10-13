@@ -157,7 +157,7 @@ class Settings(BaseSettings):
     # (the settlement average, the entry window, and the next contract's strike average).
     high_res_window_sec: int = 120
     high_res_interval_sec: float = 1.0
-    exchange_recorder: bool = True  # record top of book from the CF Benchmarks index exchanges
+    exchange_recorder: bool = True  # record order books from the CF Benchmarks index exchanges
     tape_window_sec: int = 180  # store 1-second Kalshi tape bars over each contract's final minutes
     evaluation_interval_sec: float = 3600.0  # hourly report-only evaluation (separate process)
     evaluation_timeout_sec: float = 1200.0
@@ -621,11 +621,9 @@ class TradingAgent:
         if self.exchanges is not None and (
             last_index is None or (now - last_index).total_seconds() >= max(due_every, 0.5)
         ):
-            mids = self.exchanges.mids(now)
-            if mids:
-                rows.append(
-                    IndexSample(ts=now, composite=self.exchanges.composite(now), sources=len(mids), **mids)
-                )
+            sample = self.exchanges.sample(now)
+            if sample["sources"]:
+                rows.append(IndexSample(ts=now, **sample))
                 last_index = now
         if rows:
             async with self.db.session() as session:
@@ -678,6 +676,7 @@ class TradingAgent:
             "taped": taped,
             "exchanges": self.exchanges.status(now) if self.exchanges is not None else [],
             "composite": self.exchanges.composite(now) if self.exchanges is not None else None,
+            "brti_estimate": self.exchanges.sample(now)["brti_estimate"] if self.exchanges is not None else None,
             "coinbase": self.feed.latest_price(),
             "db_mb": path.stat().st_size / 1e6 if path is not None and path.exists() else None,
             "disk_free_mb": disk.free / 1e6 if disk else None,

@@ -6,7 +6,8 @@ index-exchange sample at (or just before) that second and the Kalshi tape for th
     label            1 if the contract settled YES
     yes_bid/ask      cents; mid_prob = mid / 100
     spot_price       calibrated Coinbase (what the model saw); coinbase_raw = spot - index_gap
-    composite_spot   median mid across the index exchanges; per-exchange mids as columns
+    composite_spot   median mid across the index exchanges; per-exchange mids, depth mids and the
+                     BRTI estimate as columns (index_composite = the sample's composite)
     observed_*       the part of the settlement average already printed (final minute)
     tape_*           Kalshi prints in that second
 
@@ -20,7 +21,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from services.exchange_recorder import SOURCES
+from services.exchange_recorder import SAMPLE_FIELDS
 
 INDEX_JOIN_TOLERANCE = pd.Timedelta(seconds=2)
 
@@ -72,7 +73,7 @@ def build_training_frame(db_path: str | Path) -> pd.DataFrame:
 
     index = t["index_samples"]
     if not index.empty:
-        cols = ["ts", *[c for c in SOURCES if c in index], "composite", "sources"]
+        cols = ["ts", *[c for c in SAMPLE_FIELDS if c in index and c != "composite"], "composite", "sources"]
         joined = pd.merge_asof(
             df[["ts"]].reset_index(),
             index[cols].sort_values("ts").rename(columns={"composite": "index_composite", "sources": "index_sources"}),

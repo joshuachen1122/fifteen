@@ -11,14 +11,18 @@ from db.database import Database
 from db.models import BtcPriceHistory, ContractOutcome, IndexSample, KalshiTapeBar, MarketSnapshot
 from execution.kalshi_client import KalshiAPIError, PublicTrade
 from services.exchange_recorder import (
+    SAMPLE_FIELDS,
+    Book,
+    BookGap,
+    CryptocomHandler,
     ExchangeRecorder,
-    GeminiParser,
     composite,
-    parse_bitstamp,
-    parse_bullish,
-    parse_coinbase,
-    parse_cryptocom,
-    parse_kraken,
+    handle_bitstamp,
+    handle_bullish,
+    handle_coinbase,
+    handle_gemini,
+    handle_kraken,
+    rti_estimate,
 )
 from services.market_tape import tape_bars
 from tests.test_main import STRIKE, T0, TICKER, YES_ASK, YES_BID, Clock, FakeEvaluator, SettlingClient, advance, make_agent
@@ -35,37 +39,97 @@ async def db():
 # ---------------------------------------------------------------- exchange parsers (real message shapes)
 
 
-def test_each_exchange_message_parses_to_best_bid_and_ask() -> None:
-    assert parse_coinbase(
-        {"type": "ticker", "product_id": "BTC-USD", "price": "83073.68", "best_bid": "83073.68", "best_ask": "83073.69"}
-    ) == (83073.68, 83073.69)
-    assert parse_coinbase({"type": "subscriptions", "channels": []}) is None
-    assert parse_kraken(
-        {"channel": "ticker", "type": "snapshot", "data": [{"symbol": "BTC/USD", "bid": 83077.7, "ask": 83077.8}]}
-    ) == (83077.7, 83077.8)
-    assert parse_kraken({"channel": "heartbeat"}) is None
-    assert parse_bitstamp(
-        {
-            "data": {"bids": [["83072.76", "0.5"], ["83070.10", "0.006"]], "asks": [["83072.77", "0.1"]]},
-            "channel": "order_book_btcusd",
-            "event": "data",
-        }
-    ) == (83072.76, 83072.77)
-    assert parse_bitstamp({"event": "bts:subscription_succeeded", "channel": "order_book_btcusd", "data": {}}) is None
-    assert parse_cryptocom(
-        {"id": -1, "method": "subscribe", "result": {"channel": "ticker", "data": [{"b": "83078.48", "k": "83078.49"}]}}
-    ) == (83078.48, 83078.49)
-    assert parse_bullish(
-        {"type": "update", "dataType": "V1TATickerResponse", "data": {"bestBid": "83062.8", "bestAsk": "83062.9"}}
-    ) == (83062.8, 83062.9)
-    assert parse_kraken({"channel": "ticker", "data": [{"bid": 83080.0, "ask": 83070.0}]}) is None  # crossed
-
-    gemini = GeminiParser()
-    assert gemini({"type": "update", "events": [{"type": "change", "side": "ask", "price": "83077.27"}]}) is None
-    assert gemini({"type": "update", "events": [{"type": "change", "side": "bid", "price": "83077.26"}]}) == (
-        83077.26,
-        83077.27,
+def test_order_book_messages_build_each_venues_book() -> None:
+    book = Book()
+    assert handle_coinbase(
+        {"type": "snapshot", "product_id": "BTC-USD", "bids": [["83073.68", "0.5"], ["83070.00", "1"]],
+         "asks": [["83073.69", "0.2"]]}, book,
     )
+    assert handle_coinbase(
+        {"type": "l2update", "product_id": "BTC-USD", "changes": [["buy", "83073.68", "0.00000000"], ["sell", "83075.00", "2"]]},
+        book,
+    )
+    assert book.best() == (83070.0, 83073.69) and book.asks == {83073.69: 0.2, 83075.0: 2.0}
+    assert not handle_coinbase({"type": "subscriptions", "channels": []}, book)
+
+    kraken = Book()
+    handle_kraken(
+        {"channel": "book", "type": "snapshot", "data": [{"symbol": "BTC/USD", "bids": [{"price": 83077.7, "qty": 1.0}],
+                                                          "asks": [{"price": 83077.8, "qty": 3.0}]}]}, kraken,
+    )
+    handle_kraken({"channel": "book", "type": "update", "data": [{"bids": [{"price": 83077.7, "qty": 0.0}],
+                                                                   "asks": [{"price": 83077.75, "qty": 0.1}]}]}, kraken)
+    assert kraken.bids == {} and kraken.best() is None and min(kraken.asks) == 83077.75
+    assert not handle_kraken({"channel": "heartbeat"}, kraken)
+
+    bitstamp = Book()
+    assert handle_bitstamp({"event": "data", "channel": "order_book_btcusd",
+                            "data": {"bids": [["83072.76", "0.5"]], "asks": [["83072.77", "0.1"]]}}, bitstamp)
+    assert bitstamp.best() == (83072.76, 83072.77)
+    assert not handle_bitstamp({"event": "bts:subscription_succeeded", "channel": "order_book_btcusd", "data": {}}, bitstamp)
+
+    gemini = Book()
+    handle_gemini({"type": "l2_updates", "symbol": "BTCUSD", "changes": [["buy", "83077.26", "0.3"], ["sell", "83077.27", "1"]]}, gemini)
+    handle_gemini({"type": "l2_updates", "symbol": "BTCUSD", "changes": [["sell", "83077.27", "0.0"], ["sell", "83078", "1"]]}, gemini)
+    assert gemini.best() == (83077.26, 83078.0)
+    assert not handle_gemini({"type": "trade", "symbol": "BTCUSD"}, gemini)
+
+    bullish = Book()
+    handle_bullish({"type": "snapshot", "dataType": "V1TALevel2",
+                    "data": {"symbol": "BTCUSD", "bids": ["83299.5000", "0.03", "83299.4000", "0.004"],
+                             "asks": ["83299.6000", "0.003"]}}, bullish)
+    assert bullish.best() == (83299.5, 83299.6) and bullish.bids[83299.4] == 0.004
+
+    crossed = Book()
+    crossed.replace([(83080.0, 1.0)], [(83070.0, 1.0)])
+    assert crossed.best() is None
+
+
+def test_cryptocom_book_deltas_must_follow_the_sequence() -> None:
+    handler, book = CryptocomHandler(), Book()
+    snapshot = {"id": -1, "method": "subscribe", "result": {"channel": "book", "data": [
+        {"bids": [["83078.48", "0.5", "3"]], "asks": [["83078.49", "0.2", "1"]], "u": 10}]}}
+    assert handler(snapshot, book) and book.best() == (83078.48, 83078.49)
+    update = {"id": -1, "result": {"channel": "book.update", "data": [
+        {"update": {"bids": [["83078.48", "0", "0"], ["83078.40", "1", "1"]], "asks": []}, "u": 11, "pu": 10}]}}
+    assert handler(update, book) and book.best() == (83078.40, 83078.49)
+    gap = {"id": -1, "result": {"channel": "book.update", "data": [{"update": {"bids": [], "asks": []}, "u": 13, "pu": 12}]}}
+    with pytest.raises(BookGap):
+        handler(gap, book)
+
+
+def test_depth_mid_looks_past_dust_at_the_top_of_the_book() -> None:
+    book = Book()
+    book.replace([(83_100.0, 0.0001), (83_000.0, 5.0)], [(83_101.0, 0.5), (83_103.0, 5.0)])
+    assert book.mid() == 83_100.5
+    bid = 83_100.0 * 0.0001 + 83_000.0 * 0.9999
+    assert book.depth_mid(1.0) == pytest.approx((bid + 83_101.0 * 0.5 + 83_103.0 * 0.5) / 2)
+    assert book.depth_mid(50.0) is None  # not enough size
+
+
+def test_brti_estimate_weights_the_consolidated_book_near_the_top() -> None:
+    a, b = Book(), Book()
+    a.replace([(99.99, 1.0), (99.98, 5.0)], [(100.01, 1.0), (100.02, 5.0)])
+    b.replace([(99.97, 2.0)], [(100.03, 2.0)])
+    assert rti_estimate([a, b]) == pytest.approx(100.0)  # symmetric books: the mid
+    skewed = Book()
+    skewed.replace([(99.99, 10.0)], [(100.01, 0.1), (100.40, 10.0)])  # thin ask side
+    assert 100.0 < rti_estimate([skewed]) < 100.2
+    assert rti_estimate([Book()]) is None
+
+
+def test_recorder_samples_every_index_proxy() -> None:
+    clock = Clock(T0)
+    rec = ExchangeRecorder(clock=clock)
+    for name, mid in (("coinbase", 83_001.0), ("kraken", 83_005.0), ("bitstamp", 83_003.0)):
+        rec.update(name, mid - 1, mid + 1)
+    rec.update("gemini", 90_000.0, 90_002.0)  # a broken venue: >1% from the others, dropped
+    sample = rec.sample()
+    assert set(sample) <= {*SAMPLE_FIELDS, "sources"} and set(SAMPLE_FIELDS) <= set(IndexSample.model_fields)
+    assert sample["sources"] == 3 and "gemini" not in sample
+    assert sample["composite"] == 83_003.0 and sample["depth_composite"] == 83_003.0
+    assert sample["kraken_depth"] == 83_005.0
+    assert sample["brti_estimate"] is not None
 
 
 def test_composite_is_the_median_of_fresh_mids() -> None:
@@ -74,7 +138,7 @@ def test_composite_is_the_median_of_fresh_mids() -> None:
     assert rec.composite() is None
     rec.update("coinbase", 100.0, 102.0)  # mid 101
     rec.update("kraken", 104.0, 106.0)  # mid 105
-    rec.update("gemini", 9_000.0, 9_002.0)  # a broken venue barely moves a median
+    rec.update("gemini", 106.0, 108.0)
     assert rec.composite() == 105.0
     clock.now = T0 + timedelta(seconds=11)
     rec.update("kraken", 106.0, 108.0)
